@@ -1,0 +1,3 @@
+# Local secrets & settings (API keys live here — never commit)
+.local/
+node_modules/

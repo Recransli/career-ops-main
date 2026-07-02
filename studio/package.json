@@ -1,0 +1,15 @@
+{
+  "name": "career-ops-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal local-first web UI wrapper for career-ops — bring your own API key or local Ollama model.",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "build:roles": "node scripts/build-roles.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
