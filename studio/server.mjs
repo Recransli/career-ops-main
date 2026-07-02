@@ -145,6 +145,42 @@ const GROUNDING_RULES = `STRICT GROUNDING RULES (non-negotiable):
 - If information needed for a good answer is missing, insert a placeholder like [ADD: your notice period] instead of making something up.
 - Write in the first person as the candidate. Plain, confident, specific. No clichés ("passionate", "team player"), no flattery padding.`;
 
+// The example profile ships with Jane Smith placeholders — they must never
+// leak into generated documents. Any candidate field still holding one of
+// these is treated as unset.
+const EXAMPLE_VALUES = new Set([
+  "Jane Smith", "jane@example.com", "+1-555-0123", "San Francisco, CA",
+  "linkedin.com/in/janesmith", "https://janesmith.dev", "github.com/janesmith", "https://x.com/janesmith",
+]);
+const isExample = (v) => !v || EXAMPLE_VALUES.has(String(v).trim());
+
+function scrubCandidate(candidate = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(candidate)) out[k] = isExample(v) ? "" : v;
+  return out;
+}
+
+// Pull contact details straight out of the resume header so the profile is
+// always the user's own data, even if they never touch the contact form.
+function syncContactFromCv(cv) {
+  if (!yaml) return;
+  ensureProfile();
+  const profile = loadYaml(P.profile) || {};
+  profile.candidate = scrubCandidate(profile.candidate);
+  const head = cv.slice(0, 800);
+  const found = {
+    full_name: (head.match(/^#\s+(.+?)\s*$/m) || [])[1]?.replace(/[*_]/g, "").trim(),
+    email: (head.match(/[\w.+-]+@[\w-]+\.[\w.]+/) || [])[0],
+    phone: (head.match(/(?:\+?\d[\d\s().-]{8,}\d)/) || [])[0]?.trim(),
+    linkedin: (head.match(/(?:www\.)?linkedin\.com\/in\/[\w-]+/i) || [])[0],
+    github: (head.match(/(?:www\.)?github\.com\/[\w-]+/i) || [])[0],
+  };
+  for (const [k, v] of Object.entries(found)) {
+    if (v && !profile.candidate[k]) profile.candidate[k] = v;
+  }
+  writeFileSync(P.profile, yaml.dump(profile, { lineWidth: 120 }));
+}
+
 function ensureProfile() {
   if (!existsSync(P.profile)) {
     mkdirSync(dirname(P.profile), { recursive: true });
@@ -290,6 +326,115 @@ async function trackApplication({ company, role, status, score, reportPath, note
   writeFileSync(join(dir, `${num}-${slugify(company)}.tsv`), line + "\n");
   const r = await runNode([join(ROOT, "merge-tracker.mjs")], { timeoutMs: 60_000 });
   return { created: true, num, mergeLog: (r.out + r.err).trim().split("\n").slice(-3).join("\n") };
+}
+
+// ---------------------------------------------------------------------------
+// Tailored CV → PDF (uses the repo's own template + Playwright pipeline)
+// ---------------------------------------------------------------------------
+const escHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+const TAILOR_JSON_PROMPT = `Produce the candidate's resume TAILORED to the job description, as STRICT JSON (no fences, no commentary):
+{
+  "summary": "3-4 sentence professional summary weaving in the JD's top keywords where the resume genuinely supports them",
+  "competencies": ["8-12 short competency tags, JD-relevant ones first"],
+  "experience": [{"company": "", "role": "", "period": "", "location": "", "bullets": ["3-5 bullets; most JD-relevant first; keep the resume's real metrics"]}],
+  "projects": [{"title": "", "desc": "", "tech": ""}],
+  "education": [{"title": "degree", "org": "school", "year": ""}],
+  "certifications": [{"title": "", "org": "", "year": ""}],
+  "skills": [{"category": "", "items": "comma-separated"}]
+}
+Tailoring means REORDER and REPHRASE what the resume already contains so JD keywords surface — never add skills, employers, dates, metrics or claims that are not in the resume. Keep every company/role/date exactly as the resume states them. Omit sections the resume has no content for (empty arrays).`;
+
+// generate-pdf.mjs enforces that rendered section order matches cv.md's own
+// heading order — so we assemble sections in the user's order, not the
+// template's default order.
+function cvSectionOrder() {
+  const cv = read(P.cv) || "";
+  const KEYMAP = [
+    [/summary|profile|about/i, "summary"], [/experience|employment|work history/i, "experience"],
+    [/project/i, "projects"], [/education|academic/i, "education"],
+    [/certification|certificate|license/i, "certifications"], [/skill|technolog|competenc/i, "skills"],
+  ];
+  const order = [];
+  for (const line of cv.split("\n")) {
+    const h = line.match(/^\s{0,3}#{1,6}\s+(.+)/);
+    if (!h) continue;
+    for (const [re, key] of KEYMAP) {
+      if (re.test(h[1]) && !order.includes(key)) { order.push(key); break; }
+    }
+  }
+  return order.length ? order : ["summary", "experience", "projects", "education", "certifications", "skills"];
+}
+
+function fillCvTemplate(data, candidate) {
+  let html = readFileSync(join(ROOT, "templates", "cv-template.html"), "utf8");
+  const c = candidate || {};
+  const li = (c.linkedin || "").replace(/^https?:\/\//, "");
+  const port = c.portfolio_url || (c.github ? `https://${String(c.github).replace(/^https?:\/\//, "")}` : "");
+  const rep = {
+    LANG: "en", PAGE_WIDTH: "7.3in", PHOTO: "",
+    NAME: escHtml(c.full_name || ""), EMAIL: escHtml(c.email || ""), PHONE: escHtml(c.phone || ""),
+    LOCATION: escHtml(c.location || ""),
+    LINKEDIN_URL: li ? `https://${escHtml(li)}` : "", LINKEDIN_DISPLAY: escHtml(li),
+    PORTFOLIO_URL: escHtml(port), PORTFOLIO_DISPLAY: escHtml(port.replace(/^https?:\/\//, "")),
+  };
+  for (const [k, v] of Object.entries(rep)) html = html.split(`{{${k}}}`).join(v);
+
+  // Rebuild the contact row from only the fields that exist — the template's
+  // fixed separators leave "| |" gaps when portfolio/location are empty.
+  const contactBits = [
+    c.phone && `<a href="tel:${escHtml(c.phone)}">${escHtml(c.phone)}</a>`,
+    c.email && `<a href="mailto:${escHtml(c.email)}">${escHtml(c.email)}</a>`,
+    li && `<a href="https://${escHtml(li)}">${escHtml(li)}</a>`,
+    port && `<a href="${escHtml(port)}">${escHtml(port.replace(/^https?:\/\//, ""))}</a>`,
+    c.location && `<span>${escHtml(c.location)}</span>`,
+  ].filter(Boolean);
+  html = html.replace(/<div class="contact-row">[\s\S]*?<\/div>/,
+    `<div class="contact-row">${contactBits.join('<span class="separator">|</span>')}</div>`);
+
+  // Build each section's inner HTML, then emit them in the ORDER cv.md uses.
+  const bodies = {
+    summary: data.summary ? `<div class="summary-text">${escHtml(data.summary)}</div>` : "",
+    competencies: (data.competencies || []).length
+      ? `<div class="competencies-grid">${data.competencies.map((t) => `<span class="competency-tag">${escHtml(t)}</span>`).join("\n")}</div>` : "",
+    experience: (data.experience || []).map((j) => `
+      <div class="job">
+        <div class="job-header"><span class="job-company">${escHtml(j.company)}</span><span class="job-period">${escHtml(j.period)}</span></div>
+        <div class="job-role">${escHtml(j.role)}${j.location ? ` <span class="job-location">· ${escHtml(j.location)}</span>` : ""}</div>
+        <ul>${(j.bullets || []).map((b) => `<li>${escHtml(b)}</li>`).join("")}</ul>
+      </div>`).join("\n"),
+    projects: (data.projects || []).map((p) => `
+      <div class="project"><div class="project-title">${escHtml(p.title)}</div>
+      <div class="project-desc">${escHtml(p.desc)}</div>${p.tech ? `<div class="project-tech">${escHtml(p.tech)}</div>` : ""}</div>`).join("\n"),
+    education: (data.education || []).map((e) => `
+      <div class="edu-item"><div class="edu-header"><span class="edu-title">${escHtml(e.title)}</span><span class="edu-year">${escHtml(e.year || "")}</span></div>
+      <div class="edu-org">${escHtml(e.org || "")}</div>${e.desc ? `<div class="edu-desc">${escHtml(e.desc)}</div>` : ""}</div>`).join("\n"),
+    certifications: (data.certifications || []).length
+      ? `<div class="cert-table">${data.certifications.map((x) => `
+        <div class="cert-row"><span class="cert-title">${escHtml(x.title)}</span><span class="cert-org">${escHtml(x.org || "")}</span><span class="cert-year">${escHtml(x.year || "")}</span></div>`).join("")}</div>` : "",
+    skills: (data.skills || []).length
+      ? `<div class="skills-grid">${data.skills.map((s) => `<div class="skill-item"><span class="skill-category">${escHtml(s.category)}:</span> ${escHtml(s.items)}</div>`).join("")}</div>` : "",
+  };
+  const TITLES = {
+    summary: "Professional Summary", competencies: "Core Competencies", experience: "Work Experience",
+    projects: "Projects", education: "Education", certifications: "Certifications", skills: "Skills",
+  };
+  const order = cvSectionOrder();
+  // competencies has no cv.md heading — slot it right after summary
+  const withComp = order.includes("summary")
+    ? order.flatMap((k) => (k === "summary" ? ["summary", "competencies"] : [k]))
+    : ["competencies", ...order];
+  const sectionsHtml = withComp
+    .filter((k) => bodies[k])
+    .map((k) => `\n  <div class="section">\n    <div class="section-title">${TITLES[k]}</div>\n    ${bodies[k]}\n  </div>`)
+    .join("\n");
+
+  // Swap the template's fixed section blocks for our ordered ones.
+  const start = html.indexOf("<!-- PROFESSIONAL SUMMARY -->");
+  const end = html.lastIndexOf("</div>\n</body>");
+  if (start === -1 || end === -1) throw new Error("cv-template.html structure changed — can't place sections");
+  html = html.slice(0, start) + sectionsHtml + "\n\n" + html.slice(end);
+  return html;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +619,98 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // One click: tailor the resume to the JD and render a real ATS-clean PDF
+  // through the repo's own template + Playwright pipeline.
+  "POST /api/tailored-pdf": async (req, res) => {
+    const { jd, company, role } = await body(req);
+    if (!jd || jd.trim().length < 80) return fail(res, "Paste the job description first.");
+    try {
+      const ctx = groundingContext();
+      const raw = await chat(loadSettings(), [
+        { role: "system", content: `You tailor resumes.\n\n${ctx}\n\n${GROUNDING_RULES}\n\n${TAILOR_JSON_PROMPT}` },
+        { role: "user", content: `Company: ${company || "?"} — Role: ${role || "?"}\n\nJob description:\n${jd.slice(0, 8000)}` },
+      ], { maxTokens: 4096 });
+      const match = raw.match(/\{[\s\S]*\}/);
+      let data;
+      try { data = JSON.parse(match ? match[0] : raw); } catch { return fail(res, "The model returned malformed JSON — try again (larger models are more reliable here).", 502); }
+
+      const profile = loadYaml(P.profile) || {};
+      const candidate = scrubCandidate(profile.candidate);
+      if (!candidate.full_name || !candidate.email) return fail(res, "Missing name/email in your profile — fill Contact details on the Resume step.");
+
+      const slug = slugify(`${candidate.full_name.split(" ")[0]}-${company || role || "tailored"}`);
+      const date = new Date().toISOString().slice(0, 10);
+      const htmlPath = join(ROOT, "output", `cv-${slug}-${date}.html`);
+      const pdfPath = join(ROOT, "output", `cv-${slug}-${date}.pdf`);
+      mkdirSync(join(ROOT, "output"), { recursive: true });
+      writeFileSync(htmlPath, fillCvTemplate(data, candidate));
+
+      const r = await runNode([join(ROOT, "generate-pdf.mjs"), htmlPath, pdfPath, "--format=letter"], { timeoutMs: 120_000 });
+      if (!existsSync(pdfPath)) return fail(res, `PDF render failed: ${(r.err || r.out).slice(-400)}`, 500);
+      ok(res, { pdf: basename(pdfPath), summary: data.summary || "", competencies: data.competencies || [] });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  "GET /api/pdf-file": async (req, res, url) => {
+    const f = basename(url.searchParams.get("f") || "");
+    const p = join(ROOT, "output", f);
+    if (!f.endsWith(".pdf") || !existsSync(p)) return fail(res, "not found", 404);
+    res.writeHead(200, { "content-type": "application/pdf", "content-disposition": `attachment; filename="${f}"` });
+    res.end(readFileSync(p));
+  },
+
+  // Called by the browser extension: given the form fields found on a job
+  // application page, draft values grounded in resume + profile + interview.
+  // Unknowns stay empty — the extension never guesses and never submits.
+  "POST /api/autofill": async (req, res) => {
+    const { fields, url: pageUrl, title, pageText } = await body(req);
+    if (!Array.isArray(fields) || !fields.length) return fail(res, "fields[] required");
+    try {
+      const ctx = groundingContext();
+      const fieldList = fields.slice(0, 60).map((f) => ({
+        id: f.id, label: (f.label || "").slice(0, 120), type: f.type,
+        ...(f.options?.length ? { options: f.options.slice(0, 40) } : {}),
+      }));
+      const raw = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You fill job-application form fields for a candidate.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRules for form filling:\n- For select/radio fields, the value MUST be copied verbatim from the field's options list (pick the one matching the candidate's profile; if none clearly matches, use "").\n- Contact fields come from the profile. Authorization/sponsorship/salary/notice come from the interview block in the profile.\n- Long-answer questions: 60-140 words, grounded in the resume.\n- If the resume/profile doesn't contain the needed fact, return "" for that field. NEVER guess or invent.\n- Output STRICT JSON only: [{"id": "<field id>", "value": "<value>"}]`,
+        },
+        {
+          role: "user",
+          content: `Application page: ${title || ""} (${pageUrl || ""})\n${pageText ? `Page context:\n${String(pageText).slice(0, 3000)}\n` : ""}\nFields:\n${JSON.stringify(fieldList, null, 1)}`,
+        },
+      ], { maxTokens: 4096 });
+      const match = raw.match(/\[[\s\S]*\]/);
+      let values;
+      try { values = JSON.parse(match ? match[0] : raw); } catch { return fail(res, "Model returned malformed JSON — try again.", 502); }
+
+      // Deterministic anti-fabrication guard. Models WILL guess on these even
+      // when told not to (verified in testing) — so sensitive answers are only
+      // allowed through when the user's interview actually provides them, and
+      // demographic/EEO questions are never auto-answered at all.
+      const interview = (loadYaml(P.profile) || {}).interview || {};
+      const SENSITIVE = [
+        { re: /citizen|authoriz|right to work|work permit/i, key: "work_authorization" },
+        { re: /sponsor|visa/i, key: "needs_sponsorship" },
+        { re: /salary|compensation|pay expectation|desired pay|expected pay|rate/i, key: "salary_expectation" },
+        { re: /notice period|start date|available to start|availability/i, key: "notice_period" },
+      ];
+      const NEVER = /race|ethnic|gender|sex\b|veteran|disabilit|orientation|religio|pronoun|age\b|date of birth/i;
+      const labelOf = Object.fromEntries(fields.map((f) => [f.id, f.label || ""]));
+      for (const v of values) {
+        const label = labelOf[v.id] || "";
+        if (NEVER.test(label)) { v.value = ""; v.blocked = "self-identification — answer this yourself"; continue; }
+        const s = SENSITIVE.find((x) => x.re.test(label));
+        if (s && !String(interview[s.key] || "").trim()) {
+          v.value = "";
+          v.blocked = "not in your interview answers — complete the About You step or fill manually";
+        }
+      }
+      ok(res, { values: values.filter((v) => v && v.id) });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   // Mark a job Evaluated/Applied/SKIP etc. through the official pipeline.
   "POST /api/track": async (req, res) => {
     const { company, role, status, score, reportPath, note } = await body(req);
@@ -489,7 +726,8 @@ const routes = {
     const { content } = await body(req);
     if (!content || content.trim().length < 40) return fail(res, "Resume looks empty — paste the full text.");
     writeFileSync(P.cv, content);
-    ok(res, { saved: true });
+    syncContactFromCv(content);
+    ok(res, { saved: true, candidate: loadYaml(P.profile)?.candidate || {} });
   },
 
   "POST /api/profile": async (req, res) => {
@@ -507,7 +745,7 @@ const routes = {
 
   "GET /api/profile": async (req, res) => {
     const profile = loadYaml(P.profile);
-    ok(res, { candidate: profile?.candidate || {}, roles: profile?.target_roles?.primary || [] });
+    ok(res, { candidate: scrubCandidate(profile?.candidate), roles: profile?.target_roles?.primary || [] });
   },
 
   "POST /api/scan": async (req, res) => {

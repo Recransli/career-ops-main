@@ -145,10 +145,10 @@ stages.welcome = async () => {
   const s = await loadStatus();
   view.innerHTML = `
     <div class="stage hero">
-      <h1>Your next role is a<br>journey, not a job board.</h1>
-      <p>Connect a model — a free local Ollama or your own API key — tell Studio who you are once, and then move job by job: evaluate, tailor, answer, apply. Everything grounded in your real resume, everything on your machine.</p>
-      <button class="btn primary" id="begin">${s.cv ? "Continue your journey" : "Begin"}</button>
-      <p style="margin-top:26px;font-size:12.5px;color:var(--faint)">Drafts everything · submits nothing — the final click is always yours.</p>
+      <h1>Your AI companion for<br>the job search.</h1>
+      <p>Runs on your machine, on a model you choose. It learns your background once, then works beside you on every application — evaluating fit, tailoring your resume, drafting answers. You review everything; you send everything.</p>
+      <button class="btn primary" id="begin">${s.cv ? "Continue" : "Get started"}</button>
+      <p style="margin-top:26px;font-size:12.5px;color:var(--faint)">Private by default · nothing is ever submitted on your behalf.</p>
     </div>`;
   $("#begin").addEventListener("click", () => go(1));
 };
@@ -224,8 +224,8 @@ async function settingsForm(container, onConnected) {
 stages.model = async () => {
   view.innerHTML = `
     <div class="stage stage-narrow">
-      <div class="page-title">Choose your engine</div>
-      <p class="page-sub">Everything Studio does — evaluating, tailoring, drafting — runs on a model you control. Local means private and free; an API key means faster and sharper.</p>
+      <div class="page-title">Choose your model</div>
+      <p class="page-sub">Everything runs on a model you control — a local Ollama (private, free) or your own API key (faster, sharper). You can switch anytime from the top bar.</p>
       <div class="card" id="settings-slot"></div>
       <div class="note">Local advice: 7–8B models fabricate and miss the evaluation format. Use <b>32B+</b> (qwen2.5:32b, llama3.3:70b) — or a cheap hosted model (DeepSeek, Groq) for cents.</div>
       ${stageNav({ backTo: 0, onNext: true })}
@@ -304,8 +304,8 @@ stages.resume = async () => {
   const c = prof.candidate || {};
   view.innerHTML = `
     <div class="stage stage-narrow">
-      <div class="page-title">Bring your story</div>
-      <p class="page-sub">Your resume becomes the single source of truth — every evaluation, answer, and letter is grounded in it and nothing else. Upload any format; you review the conversion before it's saved.</p>
+      <div class="page-title">Your resume</div>
+      <p class="page-sub">This becomes the single source of truth — every evaluation, answer, and letter is grounded in it and nothing else. Upload any format; you review the conversion before it's saved.</p>
       <div class="card">
         <div class="dropzone" id="rz">
           <div style="font-size:26px">⤓</div>
@@ -323,12 +323,16 @@ stages.resume = async () => {
       </div>
       <div class="card">
         <h3>Contact details</h3>
+        <p class="hint">Auto-filled from your resume when you save it — correct anything here. Used on generated PDFs and application forms.</p>
         <div class="iv-grid">
           <div><label class="field">Full name</label><input type="text" id="p-full_name" value="${esc(c.full_name || "")}"></div>
           <div><label class="field">Email</label><input type="email" id="p-email" value="${esc(c.email || "")}"></div>
           <div><label class="field">Phone</label><input type="text" id="p-phone" value="${esc(c.phone || "")}"></div>
+          <div><label class="field">Location</label><input type="text" id="p-location" value="${esc(c.location || "")}"></div>
           <div><label class="field">LinkedIn</label><input type="text" id="p-linkedin" value="${esc(c.linkedin || "")}"></div>
+          <div><label class="field">GitHub / Portfolio</label><input type="text" id="p-github" value="${esc(c.github || "")}"></div>
         </div>
+        <div class="row end" style="margin-top:12px"><button class="btn" id="p-save">Save details</button></div>
       </div>
       ${stageNav({ backTo: 1, onNext: true })}
     </div>`;
@@ -353,18 +357,32 @@ stages.resume = async () => {
   rz.addEventListener("drop", (e) => { e.preventDefault(); rz.classList.remove("drag"); handle(e.dataTransfer.files[0]); });
   $("#rz-input").addEventListener("change", (e) => handle(e.target.files[0]));
 
+  const CONTACT_KEYS = ["full_name", "email", "phone", "location", "linkedin", "github"];
+  const saveContact = async () => {
+    const b = {};
+    for (const k of CONTACT_KEYS) b[k] = $(`#p-${k}`).value.trim();
+    await api("/api/profile", { method: "POST", body: b });
+  };
   $("#cv-save").addEventListener("click", async () => {
     try {
-      await api("/api/resume", { method: "POST", body: { content: $("#cv-text").value } });
-      const b = {};
-      for (const k of ["full_name", "email", "phone", "linkedin"]) b[k] = $(`#p-${k}`).value;
-      await api("/api/profile", { method: "POST", body: b });
+      const r = await api("/api/resume", { method: "POST", body: { content: $("#cv-text").value } });
+      // Server extracts contact from the resume header — reflect it in the form
+      // without clobbering anything the user already typed.
+      for (const k of CONTACT_KEYS) {
+        const input = $(`#p-${k}`);
+        if (!input.value.trim() && r.candidate?.[k]) input.value = r.candidate[k];
+      }
+      await saveContact();
       $("#cv-note").innerHTML = `<span class="pill ok">saved</span>`;
-      toast("Resume saved");
+      toast("Resume and contact details saved");
       state.status = null;
     } catch (e) { toast(e.message, true); }
   });
+  $("#p-save").addEventListener("click", async () => {
+    try { await saveContact(); toast("Contact details saved"); } catch (e) { toast(e.message, true); }
+  });
   wireNav(1, async () => {
+    try { await saveContact(); } catch {}
     const s = await loadStatus();
     if (!s.cv) return toast("Save your resume first", true);
     go(3);
@@ -391,8 +409,8 @@ stages.interview = async () => {
   state.interview = answers || {};
   view.innerHTML = `
     <div class="stage stage-narrow">
-      <div class="page-title">A short interview — so we never ask twice</div>
-      <p class="page-sub">Application forms ask the same things over and over: authorization, salary, notice, "tell us about yourself." Answer once here — every drafted application pulls from this, alongside your resume. Watch the globe find your cities.</p>
+      <div class="page-title">About you</div>
+      <p class="page-sub">Application forms ask the same things over and over — authorization, salary, notice, your story. Answer once here and every drafted application pulls from it. Locations you add appear on the globe and focus the job scan.</p>
       <div class="card">
         <div class="iv-grid">
           ${IV_FIELDS.map((f) => `
@@ -443,7 +461,7 @@ stages.roles = async () => {
   const cat = await loadCatalog();
   view.innerHTML = `
     <div class="stage stage-narrow">
-      <div class="page-title">What are we hunting?</div>
+      <div class="page-title">Target roles</div>
       <p class="page-sub">Search ${cat.roles.length.toLocaleString()} roles across ${Object.keys(cat.categories).length} fields. Your picks seed the scanner's keywords and decide which application questions you'll prep for.</p>
       <div class="card">
         <div id="sel-chips"></div>
@@ -541,8 +559,8 @@ stages.board = async () => {
   await Promise.all([loadJobs(), loadCatalog()]);
   view.innerHTML = `
     <div class="stage">
-      <div class="page-title">One job at a time</div>
-      <p class="page-sub">Pick a posting from the rail, evaluate the fit, tailor, answer, apply — then the next one. Your interview answers and resume ride along as context for everything.</p>
+      <div class="page-title">Applications</div>
+      <p class="page-sub">Work through one job at a time: evaluate the fit, generate a tailored PDF resume, draft answers and a letter — then apply and move to the next. On the posting itself, the <b>browser extension</b> fills the form from here (see <code>studio/extension</code>).</p>
       <div class="board">
         <aside class="job-rail" id="rail"></aside>
         <section class="workspace" id="ws"></section>
@@ -649,10 +667,25 @@ function renderWorkspace() {
   }
 
   if (w.tab === "tailor") {
-    tb.innerHTML = w.advice
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-t">Re-run</button><button class="btn small" id="cp">Copy</button></div><div class="prose">${md(w.advice)}</div>`
-      : `<button class="btn primary" id="run-t">Tailor my resume to this JD</button><p class="hint" style="margin-top:8px">Keyword alignment, what to move up, honest gaps. Reformulates — never fabricates.</p>`;
-    (tb.querySelector("#run-t") || tb.querySelector("#re-t"))?.addEventListener("click", async () => {
+    tb.innerHTML = `
+      <div class="row" style="margin:4px 0 10px">
+        <button class="btn primary" id="run-pdf">⤓ ${w.pdf ? "Regenerate" : "Generate"} tailored PDF resume</button>
+        <button class="btn" id="run-t">${w.advice ? "Re-run tailoring notes" : "Tailoring notes"}</button>
+        ${w.pdf ? `<a class="btn" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download ${esc(w.pdf)}</a>` : ""}
+      </div>
+      ${w.pdf ? `<div class="note"><b>PDF ready.</b> Your resume, reordered and rephrased for this JD — same facts, ATS-clean layout — also saved to <code>output/${esc(w.pdf)}</code>. Read it before you attach it.</div>` : `<p class="hint">One click: your resume tailored to this JD and rendered as an ATS-clean PDF through the career-ops template. Reformulates — never fabricates.</p>`}
+      ${w.advice ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="cp">Copy notes</button></div><div class="prose">${md(w.advice)}</div>` : ""}`;
+    tb.querySelector("#run-pdf")?.addEventListener("click", async () => {
+      if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
+      busy("Tailoring your resume and rendering the PDF… (local models: a few minutes)");
+      try {
+        const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
+        w.pdf = r.pdf;
+        renderWorkspace();
+        toast("Tailored PDF ready — review it before attaching");
+      } catch (e) { toast(e.message, true); renderWorkspace(); }
+    });
+    tb.querySelector("#run-t")?.addEventListener("click", async () => {
       if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
       busy("Analysing fit and tailoring…");
       try {

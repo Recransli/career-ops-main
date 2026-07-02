@@ -13,8 +13,23 @@ The whole thing is a **journey**, not a portal: Start → Model → Resume → a
 - **The onboarding interview** — answer the questions every application asks (authorization, sponsorship, salary, notice, your story) exactly once. Every drafted application pulls from these answers plus your resume. Your locations make the scanner location-aware too.
 - **1,300+ searchable job roles** across 16 fields — pick your targets and the portal scanner's keywords and your profile are configured automatically.
 - **Zero-token job scanning** — hits Greenhouse/Lever/Ashby and 40+ other job-board APIs directly through career-ops' scanner. No AI cost to find openings.
-- **A LinkedIn-style apply board** — thousands of scanned postings in a filterable rail; each job opens a workspace with four moves: **Evaluate** (full A–G report, fit score /5), **Tailor resume** (keyword alignment + what to move up, honest gaps — reformulate, never fabricate), **Answers** (the questions typically asked for that role, drafted from your resume + interview), **Cover letter**. Then *"I applied"* tracks it through career-ops' own tracker pipeline and moves you to the next job.
+- **A LinkedIn-style apply board** — thousands of scanned postings in a filterable rail; each job opens a workspace with four moves: **Evaluate** (full A–G report, fit score /5), **Tailor resume**, **Answers** (the questions typically asked for that role, drafted from your resume + interview), **Cover letter**. Then *"I applied"* tracks it through career-ops' own tracker pipeline and moves you to the next job.
+- **One-click tailored PDF** — the Tailor tab reorders and rephrases your resume for the specific JD (same facts, never new ones) and renders it through career-ops' ATS-clean template with Playwright. The generator even verifies the section order matches your own `cv.md`.
+- **A browser extension that fills applications** (`studio/extension/`) — on the actual job posting, one click scrapes the form, asks your local Studio for grounded values, fills the fields and highlights them. It never touches the submit button.
 - Facts your resume doesn't cover come back as `[ADD: …]` placeholders — the model is instructed to never invent, and you should still read every word.
+
+## The browser extension
+
+```
+chrome://extensions → Developer mode → Load unpacked → select studio/extension/
+```
+
+Keep Studio running (`node studio/server.mjs`). On any application page, click the ✦ icon → **Fill this form**. Fields are drafted from your resume, profile, and interview answers, then highlighted orange for your review.
+
+Safety is enforced server-side, not just prompted:
+- **Self-identification questions (race, gender, veteran status, disability…) are never auto-answered.**
+- Authorization, visa, salary, notice and start-date fields are only filled if *your* interview answers actually contain them — otherwise they're left blank instead of letting the model guess (models do guess; we tested).
+- Nothing is ever clicked or submitted. The extension fills and highlights, you review and send.
 
 ## Quick start
 

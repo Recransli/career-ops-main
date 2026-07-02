@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13.5px/1.5 -apple-system, "Segoe UI", sans-serif; background: #faf9f5; color: #1f1e1d; width: 270px; margin: 0; padding: 16px; }
+  h1 { font: 600 15px Georgia, serif; margin: 0 0 4px; display: flex; gap: 7px; align-items: center; }
+  .spark { width: 20px; height: 20px; border-radius: 6px; background: #d97757; color: #fff; display: inline-flex; align-items: center; justify-content: center; font: 12px -apple-system, sans-serif; }
+  p { color: #6e6b63; font-size: 12px; margin: 6px 0 12px; }
+  button { width: 100%; padding: 9px; border-radius: 9px; border: none; background: #d97757; color: #fff; font-weight: 600; font-size: 13.5px; cursor: pointer; }
+  button:hover { background: #b85c3e; }
+  button:disabled { opacity: .5; }
+  #status { font-size: 11.5px; margin-top: 10px; color: #8f8b80; }
+  .warn { color: #8c3a22; }
+</style>
+</head>
+<body>
+  <h1><span class="spark">✦</span> Studio Companion</h1>
+  <p>Drafts this application's fields from your resume and interview — on your local model. You review and submit.</p>
+  <button id="fill">Fill this form</button>
+  <div id="status">checking Studio…</div>
+  <script src="popup.js"></script>
+</body>
+</html>

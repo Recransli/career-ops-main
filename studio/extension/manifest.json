@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Career-Ops Studio Companion",
+  "version": "0.1.0",
+  "description": "Fills job application forms from your local Career-Ops Studio — your resume, your model, your machine. Never submits.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://localhost:4949/*", "http://127.0.0.1:4949/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Fill from Studio"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
