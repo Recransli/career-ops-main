@@ -15,7 +15,7 @@
  */
 
 import http from "http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync, appendFileSync } from "fs";
 import { join, dirname, extname, resolve, basename } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { spawn } from "child_process";
@@ -121,6 +121,32 @@ const P = {
 };
 
 const read = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
+
+// ---------------------------------------------------------------------------
+// Per-job artifact store + telemetry (both local, gitignored).
+// jobs.json maps a job key → { evaluate, market, tailored, cover, ... } so the
+// apply flow is resumable and each posting keeps its own mapped context.
+// ---------------------------------------------------------------------------
+const JOBS_PATH = join(LOCAL, "jobs.json");
+const TELEMETRY_PATH = join(LOCAL, "telemetry.jsonl");
+const jobKey = (o) => (o.url || `${(o.company || "").toLowerCase()}|${(o.role || "").toLowerCase()}`).slice(0, 200);
+
+function loadJobs() {
+  try { return JSON.parse(readFileSync(JOBS_PATH, "utf8")); } catch { return {}; }
+}
+function saveJobArtifact(key, patch) {
+  mkdirSync(LOCAL, { recursive: true });
+  const all = loadJobs();
+  all[key] = { ...(all[key] || {}), ...patch, updated: Date.now() };
+  writeFileSync(JOBS_PATH, JSON.stringify(all));
+  return all[key];
+}
+function logEvent(event, data = {}) {
+  try {
+    mkdirSync(LOCAL, { recursive: true });
+    appendFileSync(TELEMETRY_PATH, JSON.stringify({ t: Date.now(), event, ...data }) + "\n");
+  } catch { /* telemetry is best-effort */ }
+}
 
 function loadYaml(p) {
   const raw = read(p);
@@ -383,27 +409,43 @@ async function webSearch(query) {
 
 const jdCache = new Map(); // url → {title, company, location, html, text, source}
 
+async function greenhouseApi(board, id) {
+  for (const api of [
+    `https://boards-api.greenhouse.io/v1/boards/${board}/jobs/${id}`,
+    `https://boards-api.eu.greenhouse.io/v1/boards/${board}/jobs/${id}`,
+  ]) {
+    const r = await fetch(api).catch(() => null);
+    if (!r?.ok) continue;
+    const j = await r.json();
+    const html = sanitizeHtml(decodeEntities(j.content));
+    return { title: j.title, company: board.replace(/-/g, " "), location: j.location?.name || "", html, text: htmlToText(html), source: "greenhouse-api" };
+  }
+  return null;
+}
+
 async function fetchJdFromUrl(url) {
   if (jdCache.has(url)) return jdCache.get(url);
   const u = new URL(url);
+  const qp = u.searchParams;
   let out = null;
 
   try {
     if (/(^|\.)greenhouse\.io$/.test(u.hostname)) {
       const m = u.pathname.match(/\/([^/]+)\/jobs\/(\d+)/);
-      if (m) {
-        const region = u.hostname.includes(".eu.") ? ".eu" : "";
-        for (const api of [
-          `https://boards-api${region}.greenhouse.io/v1/boards/${m[1]}/jobs/${m[2]}`,
-          `https://boards-api.greenhouse.io/v1/boards/${m[1]}/jobs/${m[2]}`,
-        ]) {
-          const r = await fetch(api).catch(() => null);
-          if (!r?.ok) continue;
-          const j = await r.json();
-          const html = sanitizeHtml(decodeEntities(j.content));
-          out = { title: j.title, company: m[1].replace(/-/g, " "), location: j.location?.name || "", html, text: htmlToText(html), source: "greenhouse-api" };
-          break;
-        }
+      if (m) out = await greenhouseApi(m[1], m[2]);
+    } else if (qp.get("gh_jid")) {
+      // Embedded Greenhouse on a custom careers domain (CoreWeave, many others):
+      // the board slug rides in ?board= or ?for=, else guess from the hostname.
+      const id = qp.get("gh_jid");
+      const board = qp.get("board") || qp.get("for") || u.hostname.split(".").slice(-2, -1)[0];
+      out = await greenhouseApi(board, id);
+    } else if (qp.get("ashby_jid")) {
+      const org = qp.get("ashby_org") || u.hostname.split(".").slice(-2, -1)[0];
+      const r = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${org}?includeCompensation=true`).catch(() => null);
+      if (r?.ok) {
+        const j = await r.json();
+        const job = (j.jobs || []).find((x) => url.includes(x.id));
+        if (job) { const html = sanitizeHtml(job.descriptionHtml || ""); out = { title: job.title, company: org, location: job.location || "", html, text: job.descriptionPlain || htmlToText(html), source: "ashby-api" }; }
       }
     } else if (u.hostname === "jobs.lever.co") {
       const [, slug, id] = u.pathname.split("/");
@@ -431,16 +473,33 @@ async function fetchJdFromUrl(url) {
       }
     }
 
-    // Generic fallback: fetch the page, keep readable text. JS-rendered pages
-    // may come back thin — the UI falls back to manual paste in that case.
+    // Generic fallback: fetch the page and pull readable text. Prefers a JSON-LD
+    // JobPosting block (many career sites embed one even when JS-rendered),
+    // then <main>, then body. JS-only pages come back thin → UI offers paste.
     if (!out) {
-      const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (career-ops-studio)" }, redirect: "follow" }).catch(() => null);
+      const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (career-ops-studio)", "accept-language": "en" }, redirect: "follow" }).catch(() => null);
       if (r?.ok) {
         const page = await r.text();
-        const title = htmlToText((page.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
-        const bodyMatch = page.match(/<main\b[\s\S]*?<\/main>/i) || page.match(/<body\b[\s\S]*?<\/body>/i);
-        const text = htmlToText(bodyMatch ? bodyMatch[0] : page).slice(0, 20000);
-        if (text.length > 300) out = { title, company: "", location: "", html: "", text, source: "page-text" };
+        const title = htmlToText((page.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "").replace(/\s*[|\-–].*$/, "").trim();
+        // JSON-LD JobPosting
+        for (const m of page.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+          try {
+            const data = JSON.parse(m[1].trim());
+            const nodes = Array.isArray(data) ? data : (data["@graph"] || [data]);
+            const jp = nodes.find((n) => /JobPosting/i.test(n?.["@type"] || ""));
+            if (jp?.description) {
+              const html = sanitizeHtml(jp.description);
+              out = { title: jp.title || title, company: jp.hiringOrganization?.name || "", location: jp.jobLocation?.address?.addressLocality || "", html, text: htmlToText(html), source: "page-jsonld" };
+              break;
+            }
+          } catch { /* not this block */ }
+        }
+        if (!out) {
+          const stripped = page.replace(/<(nav|header|footer|aside)\b[\s\S]*?<\/\1>/gi, " ");
+          const bodyMatch = stripped.match(/<main\b[\s\S]*?<\/main>/i) || stripped.match(/<(?:article|section)\b[\s\S]*?<\/(?:article|section)>/i) || stripped.match(/<body\b[\s\S]*?<\/body>/i);
+          const text = htmlToText(bodyMatch ? bodyMatch[0] : stripped).slice(0, 20000);
+          if (text.length > 200) out = { title, company: "", location: "", html: "", text, source: "page-text" };
+        }
       }
     }
   } catch { /* fall through */ }
@@ -944,6 +1003,34 @@ RULES:
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Per-job artifact bundle — the apply flow reads this on open (resume where
+  // left off) and writes each artifact as it's produced.
+  "GET /api/job-state": async (req, res, url) => {
+    ok(res, { state: loadJobs()[jobKey({ url: url.searchParams.get("url"), company: url.searchParams.get("company"), role: url.searchParams.get("role") })] || null });
+  },
+  "POST /api/job-state": async (req, res) => {
+    const b = await body(req);
+    const key = jobKey(b);
+    ok(res, { state: saveJobArtifact(key, b.patch || {}) });
+  },
+
+  // Lightweight telemetry for future design decisions (local file only).
+  "POST /api/telemetry": async (req, res) => {
+    const { event, data } = await body(req);
+    if (event) logEvent(String(event).slice(0, 60), data || {});
+    ok(res, { logged: true });
+  },
+  "GET /api/telemetry-summary": async (req, res) => {
+    const raw = read(TELEMETRY_PATH) || "";
+    const counts = {};
+    let total = 0;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try { const e = JSON.parse(line); counts[e.event] = (counts[e.event] || 0) + 1; total++; } catch { /* skip */ }
+    }
+    ok(res, { total, counts });
+  },
+
   "POST /api/fetch-jd": async (req, res) => {
     const { url } = await body(req);
     if (!/^https?:\/\//.test(url || "")) return fail(res, "valid url required");
@@ -998,15 +1085,67 @@ RULES:
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Interview prep — step 1: AI suggests topics to prepare, from the JD/eval
+  // gap vs. the résumé. The user picks which ones matter to them.
+  "POST /api/prep-topics": async (req, res) => {
+    const { company, role } = await body(req);
+    if (!company || !role) return fail(res, "company and role required");
+    try {
+      const ctx = groundingContext();
+      const slug = slugify(company);
+      const reportFile = existsSync(P.reports) ? readdirSync(P.reports).filter((f) => f.includes(slug) && f.endsWith(".md")).sort().pop() : null;
+      const report = reportFile ? read(join(P.reports, reportFile)) : null;
+      const raw = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are an interview coach. Suggest the concrete things this candidate should prepare for THIS role, ranked by importance. Base it on the gap between the role and their résumé (use the evaluation report if given).\nOutput STRICT JSON only: {"topics":[{"topic":"short name","why":"one line why it matters for this role","priority":"high|medium|low"}]} — 6 to 10 topics, mix of technical and behavioral.`,
+        },
+        { role: "user", content: `Company: ${company} — Role: ${role}\n${report ? `\nEvaluation report:\n${report.slice(0, 5000)}` : ""}\n\nRésumé + profile:\n${ctx.slice(0, 3000)}` },
+      ], { maxTokens: 1500 });
+      let topics = [];
+      try { topics = JSON.parse((raw.match(/\{[\s\S]*\}/) || [])[0]).topics || []; } catch { /* tolerate */ }
+      logEvent("prep_topics", { company, role, n: topics.length });
+      ok(res, { topics });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // Interview prep — step 2: build a time-blocked roadmap from the user's
+  // chosen topics, scheduled between today and the interview date. Saved to
+  // interview-prep/ so the career-ops interview modes can read it.
+  "POST /api/prep-roadmap": async (req, res) => {
+    const { company, role, topics, interviewDate } = await body(req);
+    if (!company || !role || !Array.isArray(topics) || !topics.length) return fail(res, "company, role, topics[] required");
+    try {
+      const ctx = groundingContext();
+      const today = new Date().toISOString().slice(0, 10);
+      const days = interviewDate ? Math.max(1, Math.round((new Date(interviewDate) - Date.now()) / 86400000)) : null;
+      const plan = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are an interview-prep coach. Build a realistic, time-blocked study roadmap from today (${today}) to the interview${interviewDate ? ` on ${interviewDate} (~${days} days)` : " (assume ~10 days)"}. ONLY cover the topics the candidate chose.\nMarkdown with:\n## Roadmap — a day-by-day or phase-by-phase schedule (group days if many). Each block: what to study/practice, a concrete deliverable (e.g. "write out a STAR story for X", "implement Y from scratch"), and est. time.\n## Anchor to your experience — for each topic, which REAL résumé experience to connect it to (STAR pointers, no invented facts).\n## Day before — light review + logistics checklist.\nBe specific and scoped; respect the time available (don't over-schedule a 3-day runway).`,
+        },
+        { role: "user", content: `Company: ${company} — Role: ${role}\nInterview date: ${interviewDate || "not set"}\nChosen topics:\n${topics.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n\nRésumé + profile:\n${ctx.slice(0, 3000)}` },
+      ], { maxTokens: 3500 });
+      mkdirSync(join(ROOT, "interview-prep"), { recursive: true });
+      const prepPath = join(ROOT, "interview-prep", `${slugify(company)}-${slugify(role)}-roadmap.md`);
+      writeFileSync(prepPath, `# Interview roadmap — ${company} · ${role}\n\n_Interview: ${interviewDate || "TBD"} · generated ${today}_\n\n**Preparing:** ${topics.join(", ")}\n\n${plan}`);
+      // persist date + topics on the job artifact so Track can show a countdown
+      saveJobArtifact(jobKey({ company, role }), { interviewDate: interviewDate || "", prepTopics: topics, roadmapFile: `interview-prep/${basename(prepPath)}` });
+      logEvent("prep_roadmap", { company, role, topics: topics.length, days });
+      ok(res, { plan, file: `interview-prep/${basename(prepPath)}` });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   // One click: tailor the resume to the JD and render a real ATS-clean PDF
   // through the repo's own template + Playwright pipeline.
   "POST /api/tailored-pdf": async (req, res) => {
-    const { jd, company, role } = await body(req);
+    const { jd, company, role, context } = await body(req);
     if (!jd || jd.trim().length < 80) return fail(res, "Paste the job description first.");
     try {
       const ctx = groundingContext();
+      const extra = context ? `\n\nUSE THIS FIT ANALYSIS + MARKET INTEL to decide what to surface (emphasise the candidate's real strengths these highlight; do not invent):\n${String(context).slice(0, 3500)}` : "";
       const raw = await chat(loadSettings(), [
-        { role: "system", content: `You tailor resumes.\n\n${ctx}\n\n${GROUNDING_RULES}\n\n${TAILOR_JSON_PROMPT}` },
+        { role: "system", content: `You tailor resumes.\n\n${ctx}\n\n${GROUNDING_RULES}\n\n${TAILOR_JSON_PROMPT}${extra}` },
         { role: "user", content: `Company: ${company || "?"} — Role: ${role || "?"}\n\nJob description:\n${jd.slice(0, 8000)}` },
       ], { maxTokens: 4096 });
       const match = raw.match(/\{[\s\S]*\}/);
@@ -1026,6 +1165,7 @@ RULES:
 
       const r = await runNode([join(ROOT, "generate-pdf.mjs"), htmlPath, pdfPath, "--format=letter"], { timeoutMs: 120_000 });
       if (!existsSync(pdfPath)) return fail(res, `PDF render failed: ${(r.err || r.out).slice(-400)}`, 500);
+      logEvent("tailored_pdf", { company, role, withContext: !!context });
       ok(res, { pdf: basename(pdfPath), summary: data.summary || "", competencies: data.competencies || [] });
     } catch (e) { fail(res, e.message, 502); }
   },
@@ -1142,6 +1282,7 @@ RULES:
     const CANONICAL = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"];
     if (!CANONICAL.includes(status)) return fail(res, `status must be one of: ${CANONICAL.join(", ")}`);
     try {
+      logEvent("status_change", { company, role, status });
       ok(res, await trackApplication({ company, role, status, score, reportPath, note }));
     } catch (e) { fail(res, e.message, 500); }
   },
@@ -1202,6 +1343,7 @@ RULES:
     const reportRel = (r.out.match(/reports\/[\w.\-]+\.md/) || [])[0] || null;
     const report = reportRel ? read(join(ROOT, reportRel)) : null;
     if (r.code !== 0 && !report) return fail(res, `Evaluator failed: ${(r.err || r.out).slice(-500)}`, 502);
+    logEvent("evaluate", { provider: s.provider, model: s.model });
     ok(res, { reportPath: reportRel, report, log: r.out.split("\n").slice(-15).join("\n") });
   },
 

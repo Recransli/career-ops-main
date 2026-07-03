@@ -890,6 +890,17 @@ function renderWorkspace() {
   w.company ||= job.company || ""; w.role ||= job.role || "";
   const score = w.score ?? (job.score ? parseFloat(job.score) : null);
 
+  // Restore any previously-produced artifacts for this posting (once).
+  if (!w.restored) {
+    w.restored = true;
+    const qs = new URLSearchParams({ url: job.url || "", company: w.company, role: w.role });
+    api(`/api/job-state?${qs}`).then(({ state: s }) => {
+      if (!s) return;
+      for (const k of ["report", "reportPath", "score", "market", "marketSources", "pdf", "tailorSummary", "letter"]) if (s[k] != null && w[k] == null) w[k] = s[k];
+      if (state.activeJob === job.id) renderWorkspace();
+    }).catch(() => {});
+  }
+
   // Auto-retrieve the posting — the user should never have to paste a JD.
   if (job.url && w.jdStatus === undefined) {
     w.jdStatus = "loading";
@@ -911,7 +922,11 @@ function renderWorkspace() {
       });
   }
 
-  const TABS = [["evaluate", "Evaluate"], ["market", "Market"], ["tailor", "Tailor PDF"], ["improve", "Improve résumé"], ["answers", "Answers"], ["letter", "Cover letter"]];
+  const st = w.step || "idle"; // idle → evaluating → marketing → tailoring → covering → done
+  const running = w.running;
+  const doneStep = { evaluating: !!w.report, marketing: !!w.market, tailoring: !!w.pdf, covering: !!w.letter };
+  const stepLabel = { evaluating: "Evaluating fit (A–G)", marketing: "Reading the current market", tailoring: "Tailoring your résumé → PDF", covering: "Drafting the cover letter" };
+
   wsEl.innerHTML = `
     <div class="card">
       <div class="row">
@@ -928,173 +943,188 @@ function renderWorkspace() {
         <div><label class="field">Role title</label><input type="text" id="w-role" value="${esc(w.role)}" placeholder="e.g. ${esc(state.selectedRoles[0] || "Machine Learning Engineer")}"></div>
       </div>
       ${jdBlock(job, w)}
-      <div class="ws-tabs">${TABS.map(([id, l]) => `<button class="ws-tab ${w.tab === id ? "active" : ""}" data-tab="${id}">${l}</button>`).join("")}</div>
-      <div id="tab-body"></div>
+      ${!running && !w.report ? `<div class="row" style="margin-top:12px"><button class="btn primary" id="run-pipe">✦ Prepare this application</button><span class="hint" style="margin:0">Evaluates fit, reads the market, tailors your résumé, drafts a cover letter — one pass. A few minutes on local models.</span></div>` : ""}
+      ${running || w.report ? pipelineStepper(w, doneStep, stepLabel) : ""}
     </div>
-    ${score !== null && score < 4 ? `<div class="note ethics"><b>Below the bar.</b> career-ops recommends against applying under 4/5 — your time and the recruiter's are worth more. Skip unless you have a specific reason.</div>` : ""}`;
+    ${score !== null && score < 4 ? `<div class="note ethics"><b>Below the bar.</b> career-ops recommends against applying under 4/5 — your time and the recruiter's are worth more. Skip unless you have a specific reason.</div>` : ""}
+    <div id="pipe-sections"></div>`;
 
   $("#w-company").addEventListener("input", (e) => (w.company = e.target.value));
   $("#w-role").addEventListener("input", (e) => (w.role = e.target.value));
   $("#w-jd")?.addEventListener("input", (e) => (w.jd = e.target.value));
   $("#jd-retry")?.addEventListener("click", () => { w.jdStatus = undefined; renderWorkspace(); });
-  $$("#ws .ws-tab[data-tab]").forEach((t) => t.addEventListener("click", () => { w.tab = t.dataset.tab; renderWorkspace(); }));
-
   $("#mark-applied").addEventListener("click", () => trackJob(job, w, "Applied"));
   $("#mark-skip").addEventListener("click", () => trackJob(job, w, "SKIP"));
+  $("#run-pipe")?.addEventListener("click", () => runPipeline(job, w));
 
-  const tb = $("#tab-body");
-  const busy = (msg) => (tb.innerHTML = `<div class="empty">${spin} ${esc(msg)}</div>`);
+  renderPipeSections(job, w);
+}
 
-  if (w.tab === "evaluate") {
-    tb.innerHTML = w.report
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-eval">Re-run</button><button class="btn small" id="cp">Copy</button></div><div class="prose">${md(w.report)}</div>`
-      : `<button class="btn primary" id="run-eval">Run A–G evaluation</button><p class="hint" style="margin-top:8px">Full career-ops report: fit score, gaps, leverage, verdict. Local models take a few minutes.</p>`;
-    (tb.querySelector("#run-eval") || tb.querySelector("#re-eval"))?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 100) return toast("Paste the JD first", true);
-      busy("Evaluating against your resume…");
-      try {
-        const r = await api("/api/evaluate", { method: "POST", body: { jd: w.jd } });
-        w.report = r.report; w.reportPath = r.reportPath; w.score = scoreOf(r.report);
-        if (w.company && w.role) await api("/api/track", { method: "POST", body: { company: w.company, role: w.role, status: "Evaluated", score: w.score, reportPath: w.reportPath, note: "via Studio" } }).catch(() => {});
-        renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.report));
-  }
+function pipelineStepper(w, done, labels) {
+  const order = ["evaluating", "marketing", "tailoring", "covering"];
+  return `<div class="stepper">${order.map((s) => {
+    const isDone = done[s], isNow = w.running && w.step === s;
+    return `<div class="step ${isDone ? "done" : ""} ${isNow ? "now" : ""}">
+      <span class="dot">${isDone ? "✓" : isNow ? "●" : "○"}</span>${esc(labels[s])}${isNow ? ` ${spin}` : ""}</div>`;
+  }).join("")}</div>`;
+}
 
-  if (w.tab === "tailor") {
-    tb.innerHTML = `
-      <div class="row" style="margin:4px 0 10px">
-        <button class="btn primary" id="run-pdf">⤓ ${w.pdf ? "Regenerate" : "Generate"} tailored PDF resume</button>
-        <button class="btn" id="run-t">${w.advice ? "Re-run tailoring notes" : "Tailoring notes"}</button>
-        ${w.pdf ? `<a class="btn" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download ${esc(w.pdf)}</a>` : ""}
-      </div>
-      ${w.pdf ? `<div class="note"><b>PDF ready.</b> Your resume, reordered and rephrased for this JD — same facts, ATS-clean layout — also saved to <code>output/${esc(w.pdf)}</code>. Read it before you attach it.</div>` : `<p class="hint">One click: your resume tailored to this JD and rendered as an ATS-clean PDF through the career-ops template. Reformulates — never fabricates.</p>`}
-      ${w.advice ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="cp">Copy notes</button></div><div class="prose">${md(w.advice)}</div>` : ""}`;
-    tb.querySelector("#run-pdf")?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
-      busy("Tailoring your resume and rendering the PDF… (local models: a few minutes)");
-      try {
-        const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.pdf = r.pdf;
-        renderWorkspace();
-        toast("Tailored PDF ready — review it before attaching");
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#run-t")?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
-      busy("Analysing fit and tailoring…");
-      try {
-        const r = await api("/api/tailor", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.advice = r.advice; renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.advice));
-  }
+// The auto-pipeline: JD → evaluate → market → tailor (with eval+market as
+// context) → cover letter. Each artifact persists to the backend job store so
+// reopening the job restores everything.
+async function runPipeline(job, w) {
+  if (w.running) return;
+  if ((w.jd || "").trim().length < 80) return toast("The job description hasn't loaded yet", true);
+  if (!w.company || !w.role) return toast("Fill in company and role first", true);
+  w.running = true;
+  const persist = (patch) => api("/api/job-state", { method: "POST", body: { url: job.url, company: w.company, role: w.role, patch } }).catch(() => {});
+  api("/api/telemetry", { method: "POST", body: { event: "pipeline_start", data: { company: w.company } } }).catch(() => {});
+  try {
+    if (!w.report) {
+      w.step = "evaluating"; renderWorkspace();
+      const r = await api("/api/evaluate", { method: "POST", body: { jd: w.jd } });
+      w.report = r.report; w.reportPath = r.reportPath; w.score = scoreOf(r.report);
+      await api("/api/track", { method: "POST", body: { company: w.company, role: w.role, status: "Evaluated", score: w.score, reportPath: w.reportPath, note: "via Studio" } }).catch(() => {});
+      await persist({ report: w.report, reportPath: w.reportPath, score: w.score });
+      renderPipeSections(job, w);
+    }
+    if (!w.market) {
+      w.step = "marketing"; renderWorkspace();
+      const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } });
+      w.market = r.summary; w.marketSources = r.sources;
+      await persist({ market: w.market, marketSources: w.marketSources });
+      renderPipeSections(job, w);
+    }
+    if (!w.pdf) {
+      w.step = "tailoring"; renderWorkspace();
+      // eval + market flow in as tailoring context
+      const context = [w.report ? `FIT ANALYSIS:\n${w.report}` : "", w.market ? `MARKET:\n${w.market}` : ""].filter(Boolean).join("\n\n");
+      const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } });
+      w.pdf = r.pdf; w.tailorSummary = r.summary;
+      await persist({ pdf: w.pdf, tailorSummary: w.tailorSummary });
+      renderPipeSections(job, w);
+    }
+    if (!w.letter) {
+      w.step = "covering"; renderWorkspace();
+      const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
+      w.letter = r.letter;
+      await persist({ letter: w.letter });
+    }
+    w.step = "done";
+    toast("Application prepared — review each part below");
+  } catch (e) { toast(e.message, true); }
+  w.running = false;
+  renderWorkspace();
+}
 
-  if (w.tab === "market") {
-    tb.innerHTML = w.market
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-m">Refresh</button></div>
-         <div class="prose">${md(w.market)}</div>
-         ${w.marketSources?.length ? `<p class="hint" style="margin-top:8px">Sources: ${w.marketSources.map((s, i) => `<a href="${esc(s.url)}" target="_blank">[${i + 1}]</a>`).join(" ")}</p>` : ""}`
-      : `<button class="btn primary" id="run-m">Search the web for current trends</button>
-         <p class="hint" style="margin-top:8px">Live search for what employers want for <b>${esc(w.role || "this role")}</b> right now — in-demand skills, what's rising, and how you stack up.</p>`;
-    (tb.querySelector("#run-m") || tb.querySelector("#re-m"))?.addEventListener("click", async () => {
-      if (!w.role) return toast("Fill in the role title first", true);
-      busy("Searching the web and reading the top results…");
-      try {
-        const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } });
-        w.market = r.summary; w.marketSources = r.sources; renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-  }
+// The linear result sections (no tabs): Fit → Tailored résumé (+ inline
+// collapsible improve chat) → Cover letter → Application answers.
+function renderPipeSections(job, w) {
+  const host = $("#pipe-sections");
+  if (!host) return;
+  const sections = [];
 
-  if (w.tab === "improve") {
+  if (w.report) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Fit ${w.score ? `· ${w.score}/5` : ""}</h3>
+      <button class="btn small" data-act="re-eval">Re-run</button></div>
+      <details><summary class="hint" style="cursor:pointer">Full A–G report</summary><div class="prose">${md(w.report)}</div></details></div>`);
+
+  if (w.market) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Market intel</h3>
+      <button class="btn small" data-act="re-market">Refresh</button></div>
+      <details><summary class="hint" style="cursor:pointer">What this role needs right now${w.marketSources?.length ? ` · sources ${w.marketSources.map((s, i) => `<a href="${esc(s.url)}" target="_blank">[${i + 1}]</a>`).join(" ")}` : ""}</summary><div class="prose">${md(w.market)}</div></details></div>`);
+
+  if (w.pdf) {
     w.improveMsgs ||= [];
-    w.improveDraft ||= null;
-    tb.innerHTML = `
-      <div class="improve">
-        <div class="improve-preview">
-          <div class="row" style="margin-bottom:6px"><b style="margin-right:auto;font-size:12.5px">Résumé preview</b>
-            ${w.improveDraft ? `<button class="btn small primary" id="imp-accept">Save to cv.md</button>` : ""}</div>
-          <div class="preview-body prose" id="imp-body">${md(w.improveDraft || currentCvCache || "Loading your résumé…")}</div>
+    sections.push(`
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Tailored résumé</h3>
+          <a class="btn small" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download PDF</a>
+          <button class="btn small" data-act="re-tailor">Regenerate</button>
+          <button class="btn small" data-act="toggle-improve">${w.improveOpen ? "Close improve chat ✕" : "Improve ✎"}</button>
         </div>
-        <div class="improve-chat">
-          <div class="chat-log" id="imp-log">${w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") || `<div class="empty" style="padding:12px">Ask me to sharpen bullets, align to this JD, tighten the summary… I'll show the new version on the left. Same facts, better told.</div>`}</div>
-          <div class="row" style="margin-top:8px">
-            <input type="text" id="imp-in" placeholder="e.g. make the summary punchier and lead with GenAI">
-            <button class="btn primary" id="imp-send">Send</button>
+        <p class="hint">Reordered & rephrased for this JD using the fit + market analysis above — same facts, ATS-clean. Saved to <code>output/${esc(w.pdf)}</code>.</p>
+        <div class="improve-split ${w.improveOpen ? "open" : ""}">
+          <div class="improve-preview">
+            <div class="row" style="margin-bottom:6px"><b style="margin-right:auto;font-size:12.5px">Résumé preview</b>
+              ${w.improveDraft ? `<button class="btn small primary" data-act="imp-accept">Save to cv.md</button>` : ""}</div>
+            <div class="preview-body prose" id="imp-body">${md(w.improveDraft || currentCvCache || "Loading…")}</div>
+          </div>
+          <div class="improve-chat">
+            <div class="chat-log" id="imp-log">${w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") || `<div class="empty" style="padding:12px">Ask me to sharpen bullets or align wording — I'll show the new résumé on the left. Same facts, better told.</div>`}</div>
+            <div class="row" style="margin-top:8px"><input type="text" id="imp-in" placeholder="e.g. lead the summary with GenAI"><button class="btn primary" data-act="imp-send">Send</button></div>
           </div>
         </div>
-      </div>`;
-    if (!currentCvCache) api("/api/resume").then((r) => { currentCvCache = r.content; if (!w.improveDraft && w.tab === "improve") $("#imp-body").innerHTML = md(r.content); });
-    const impSend = async () => {
-      const text = $("#imp-in").value.trim();
-      if (!text) return;
-      $("#imp-in").value = "";
-      w.improveMsgs.push({ role: "user", content: text });
-      $("#imp-log").innerHTML = w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
-      $("#imp-log").scrollTop = 1e9;
-      try {
-        const r = await api("/api/resume-chat", { method: "POST", body: { messages: w.improveMsgs, jd: w.jd, company: w.company, role: w.role } });
-        w.improveMsgs.push({ role: "assistant", content: r.reply.replace(/```(?:markdown|md)?\n[\s\S]*?```/, "_(updated résumé shown in the preview →)_") });
-        if (r.draft) w.improveDraft = r.draft;
-        renderWorkspace();
-      } catch (e) { w.improveMsgs.pop(); toast(e.message, true); renderWorkspace(); }
-    };
-    tb.querySelector("#imp-send").addEventListener("click", impSend);
-    tb.querySelector("#imp-in").addEventListener("keydown", (e) => { if (e.key === "Enter") impSend(); });
-    tb.querySelector("#imp-accept")?.addEventListener("click", async () => {
-      if (!confirm("Replace your master résumé (cv.md) with this improved version? Your original is overwritten.")) return;
-      try {
-        await api("/api/resume", { method: "POST", body: { content: w.improveDraft } });
-        currentCvCache = w.improveDraft;
-        toast("Saved to cv.md — all future output uses it");
-      } catch (e) { toast(e.message, true); }
-    });
+      </div>`);
   }
 
-  if (w.tab === "answers") {
+  if (w.letter) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Cover letter</h3>
+      <button class="btn small" data-act="cl-copy">Copy</button>
+      <button class="btn small" data-act="cl-dl">Download</button>
+      <button class="btn small" data-act="re-letter">Rewrite</button></div>
+      <div class="prose">${md(w.letter)}</div></div>`);
+
+  // Application answers stay available as a collapsible section
+  if (w.report || w.pdf) {
     const qs = questionsForRole(w.role);
-    tb.innerHTML = `
-      <p class="hint">${qs.length} questions typically asked for this role — answered from your resume <i>and</i> your onboarding interview (salary, authorization, notice…).</p>
-      <button class="btn primary" id="run-a">${w.answers ? "Re-draft answers" : "Draft all answers"}</button>
-      <div style="margin-top:12px">${qs.map((q, i) => `
-        <div class="qa"><div class="q">${esc(q)}</div><div class="a">${w.answers?.[i] ? markAdds(w.answers[i]) : ""}</div>
-        ${w.answers?.[i] ? `<div class="tools row"><button class="btn small" data-cp="${i}">Copy</button></div>` : ""}</div>`).join("")}</div>`;
-    tb.querySelector("#run-a").addEventListener("click", async () => {
-      busy("Drafting answers from your resume + interview…");
-      try {
-        const r = await api("/api/answers", { method: "POST", body: { questions: qs, jd: w.jd, company: w.company, role: w.role } });
-        w.answers = qs.map((q, i) => r.answers[i]?.a || r.answers.find((x) => x.q === q)?.a || "");
-        renderWorkspace();
-        toast("Drafted — review every answer before pasting anywhere");
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    $$("[data-cp]", tb).forEach((b) => b.addEventListener("click", () => copyText(w.answers[+b.dataset.cp])));
+    sections.push(`
+      <div class="card"><div class="row"><h3 style="margin-right:auto">Application answers</h3>
+        <button class="btn small primary" data-act="answers">${w.answers ? "Re-draft" : "Draft answers"}</button></div>
+        <p class="hint">${qs.length} questions typically asked, from your résumé + interview facts.</p>
+        <div id="answers-body">${(w.answers || []).map((a, i) => `<div class="qa"><div class="q">${esc(qs[i])}</div><div class="a">${a ? markAdds(a) : ""}</div>${a ? `<div class="tools row"><button class="btn small" data-cp="${i}">Copy</button></div>` : ""}</div>`).join("")}</div></div>`);
   }
 
-  if (w.tab === "letter") {
-    tb.innerHTML = w.letter
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-l">Re-write</button><button class="btn small" id="cp">Copy</button><button class="btn small" id="dl">Download .md</button></div><div class="prose">${md(w.letter)}</div>`
-      : `<button class="btn primary" id="run-l">Write cover letter</button><p class="hint" style="margin-top:8px">3–4 tight paragraphs grounded in your resume.</p>`;
-    (tb.querySelector("#run-l") || tb.querySelector("#re-l"))?.addEventListener("click", async () => {
-      if (!w.company && !w.jd) return toast("Give me at least a company name or the JD", true);
-      busy("Writing…");
-      try {
-        const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.letter = r.letter; renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.letter));
-    tb.querySelector("#dl")?.addEventListener("click", () => {
-      const a = Object.assign(document.createElement("a"), {
-        href: URL.createObjectURL(new Blob([w.letter], { type: "text/markdown" })),
-        download: `cover-letter-${(w.company || "draft").toLowerCase().replace(/\s+/g, "-")}.md`,
-      });
-      a.click();
-    });
-  }
+  host.innerHTML = sections.join("");
+  if (!currentCvCache && w.pdf) api("/api/resume").then((r) => { currentCvCache = r.content; if (!w.improveDraft) { const b = $("#imp-body"); if (b) b.innerHTML = md(r.content); } });
+  wireSections(job, w);
+}
+
+function wireSections(job, w) {
+  const reRun = async (fn, msg) => { toast(msg); try { await fn(); } catch (e) { toast(e.message, true); } renderWorkspace(); };
+  const on = (act, handler) => $$(`[data-act="${act}"]`).forEach((b) => b.addEventListener("click", handler));
+
+  on("re-eval", () => { w.report = null; w.step = "evaluating"; w.running = false; runPipeline(job, w); });
+  on("re-market", () => reRun(async () => { const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } }); w.market = r.summary; w.marketSources = r.sources; }, "Refreshing market…"));
+  on("re-tailor", () => reRun(async () => { const context = [w.report && `FIT:\n${w.report}`, w.market && `MARKET:\n${w.market}`].filter(Boolean).join("\n\n"); const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } }); w.pdf = r.pdf; }, "Regenerating résumé…"));
+  on("re-letter", () => reRun(async () => { const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; }, "Rewriting letter…"));
+  on("toggle-improve", () => { w.improveOpen = !w.improveOpen; renderPipeSections(job, w); });
+  on("cl-copy", () => copyText(w.letter));
+  on("cl-dl", () => { const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([w.letter], { type: "text/markdown" })), download: `cover-letter-${(w.company || "draft").toLowerCase().replace(/\s+/g, "-")}.md` }); a.click(); });
+
+  on("answers", async () => {
+    const qs = questionsForRole(w.role);
+    $("#answers-body").innerHTML = `<div class="empty">${spin} Drafting…</div>`;
+    try {
+      const r = await api("/api/answers", { method: "POST", body: { questions: qs, jd: w.jd, company: w.company, role: w.role } });
+      w.answers = qs.map((q, i) => r.answers[i]?.a || r.answers.find((x) => x.q === q)?.a || "");
+      renderPipeSections(job, w);
+    } catch (e) { toast(e.message, true); renderPipeSections(job, w); }
+  });
+  $$("[data-cp]").forEach((b) => b.addEventListener("click", () => copyText(w.answers[+b.dataset.cp])));
+
+  // improve chat
+  const impSend = async () => {
+    const input = $("#imp-in");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    w.improveMsgs.push({ role: "user", content: text });
+    $("#imp-log").innerHTML = w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
+    $("#imp-log").scrollTop = 1e9;
+    try {
+      const r = await api("/api/resume-chat", { method: "POST", body: { messages: w.improveMsgs, jd: w.jd, company: w.company, role: w.role } });
+      w.improveMsgs.push({ role: "assistant", content: r.reply.replace(/```(?:markdown|md)?\n[\s\S]*?```/, "_(updated résumé shown in the preview →)_") });
+      if (r.draft) w.improveDraft = r.draft;
+      renderPipeSections(job, w);
+    } catch (e) { w.improveMsgs.pop(); toast(e.message, true); renderPipeSections(job, w); }
+  };
+  on("imp-send", impSend);
+  $("#imp-in")?.addEventListener("keydown", (e) => { if (e.key === "Enter") impSend(); });
+  on("imp-accept", async () => {
+    if (!confirm("Replace your master résumé (cv.md) with this improved version?")) return;
+    try { await api("/api/resume", { method: "POST", body: { content: w.improveDraft } }); currentCvCache = w.improveDraft; toast("Saved to cv.md"); } catch (e) { toast(e.message, true); }
+  });
 }
 
 function questionsForRole(roleTitle) {
@@ -1167,7 +1197,8 @@ stages.track = async () => {
           ${c?.next_action || c?.action ? `<div class="note" style="margin:10px 0 4px">Follow-up: ${esc(c.next_action || c.action)}${c.due || c.next_date ? ` · ${esc(c.due || c.next_date)}` : ""}</div>`
             : d >= 7 && r.status === "Applied" ? `<div class="note" style="margin:10px 0 4px">${d} days with no response — a short, polite follow-up is reasonable now.</div>` : ""}
           <div class="row" style="margin-top:10px">
-            <button class="btn small primary" data-prep>Prep plan</button>
+            <button class="btn small primary" data-prep>Prep for interview</button>
+            <label class="hint" style="margin:0">Interview date <input type="date" data-ivdate style="width:auto;padding:4px 8px;font-size:12.5px"></label>
             ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back → ${NEXT[r.status]}</button>` : ""}
             ${r.status !== "Offer" ? `<button class="btn small" data-status="Rejected">Rejected</button>` : ""}
           </div>
@@ -1184,14 +1215,35 @@ stages.track = async () => {
     </div>`;
 
   $("#back-board").addEventListener("click", () => go(6));
+  // Interview prep, two steps: AI suggests topics → you pick → roadmap to date.
   $$("#view [data-prep]").forEach((b) => b.addEventListener("click", async () => {
     const card = b.closest(".card");
     const out = card.querySelector(".prep-out");
+    const co = card.dataset.co, role = card.dataset.role;
     b.disabled = true;
-    out.innerHTML = `<div class="empty">${spin} Building your prep plan — gaps, study plan, likely questions…</div>`;
+    out.innerHTML = `<div class="empty">${spin} Analysing what you should prepare for this role…</div>`;
     try {
-      const r = await api("/api/prep", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role } });
-      out.innerHTML = `<div class="note">Saved to <code>${esc(r.file)}</code> — the career-ops interview modes read this too.</div><div class="prose">${md(r.plan)}</div>`;
+      const { topics } = await api("/api/prep-topics", { method: "POST", body: { company: co, role } });
+      if (!topics.length) { out.innerHTML = `<div class="note">Couldn't derive topics — try again.</div>`; b.disabled = false; return; }
+      out.innerHTML = `
+        <div class="note" style="margin-bottom:8px">Pick what <b>you</b> want to focus on — I'll build a roadmap to your interview date.</div>
+        <div id="topics-${co.replace(/\W/g, "")}">${topics.map((t, i) => `
+          <label class="topic-opt"><input type="checkbox" data-topic="${esc(t.topic)}" ${t.priority === "high" ? "checked" : ""}>
+          <span><b>${esc(t.topic)}</b> <span class="pill ${t.priority === "high" ? "warn" : "off"}">${esc(t.priority)}</span><br><span class="hint">${esc(t.why)}</span></span></label>`).join("")}</div>
+        <div class="row" style="margin-top:10px"><button class="btn small primary" data-roadmap>Build my roadmap →</button></div>
+        <div class="roadmap-out"></div>`;
+      out.querySelector("[data-roadmap]").addEventListener("click", async (ev) => {
+        const chosen = [...out.querySelectorAll("[data-topic]:checked")].map((c) => c.dataset.topic);
+        if (!chosen.length) return toast("Pick at least one topic", true);
+        const ivDate = card.querySelector("[data-ivdate]").value;
+        const rout = out.querySelector(".roadmap-out");
+        ev.target.disabled = true;
+        rout.innerHTML = `<div class="empty">${spin} Building a roadmap${ivDate ? ` to ${ivDate}` : ""}…</div>`;
+        try {
+          const r = await api("/api/prep-roadmap", { method: "POST", body: { company: co, role, topics: chosen, interviewDate: ivDate } });
+          rout.innerHTML = `<div class="note">Saved to <code>${esc(r.file)}</code>.</div><div class="prose">${md(r.plan)}</div>`;
+        } catch (e) { rout.innerHTML = ""; toast(e.message, true); }
+      });
     } catch (e) { out.innerHTML = ""; toast(e.message, true); }
     b.disabled = false;
   }));
