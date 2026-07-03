@@ -391,14 +391,34 @@ stages.resume = async () => {
 };
 
 /* 3 — Interview (the "you" stage — location-aware) */
+const PNTS = "Prefer not to say";
 const IV_FIELDS = [
-  { k: "home_location", label: "Where are you based?", ph: "e.g. Hyderabad, India", globe: true },
-  { k: "target_locations", label: "Where would you work? (comma-separated cities/countries)", ph: "e.g. Bangalore, Remote, London, USA", globe: true },
-  { k: "remote_preference", label: "Work style", type: "select", opts: ["Remote only", "Remote preferred, hybrid OK", "Hybrid", "Onsite OK", "Anything"] },
-  { k: "work_authorization", label: "Where are you authorized to work?", ph: "e.g. India citizen; US H-1B transfer needed" },
-  { k: "needs_sponsorship", label: "Would you need visa sponsorship abroad?", type: "select", opts: ["No", "Yes", "Depends on country"] },
-  { k: "salary_expectation", label: "Salary expectation (range + currency)", ph: "e.g. ₹45–60 LPA / $140–170k" },
-  { k: "notice_period", label: "Notice period / start date", ph: "e.g. 30 days" },
+  { section: "Location & eligibility" },
+  { k: "home_location", label: "Where are you based?", ph: "e.g. Jersey City, NJ", globe: true },
+  { k: "target_locations", label: "Where would you work? (comma-separated cities/countries)", ph: "e.g. New York, Remote, London", globe: true },
+  { k: "address_search", label: "Street address — start typing, pick a suggestion", ph: "e.g. 554 Washington Blvd…", wide: true, addr: true },
+  { k: "address_line1", label: "Address line 1" },
+  { k: "address_city", label: "City" },
+  { k: "address_state", label: "State / region" },
+  { k: "address_postcode", label: "ZIP / postal code" },
+  { k: "address_country", label: "Country" },
+  { k: "work_authorization", label: "Where are you authorized to work? (status too)", ph: "e.g. US — F1 CPT; India citizen" },
+  { k: "needs_sponsorship", label: "Will you need visa sponsorship now or in future?", type: "select", opts: ["", "No", "Yes", "Depends on country"] },
+  { k: "over_18", label: "Are you 18 or older?", type: "select", opts: ["", "Yes", "No"] },
+  { section: "Logistics & compensation" },
+  { k: "remote_preference", label: "Work style", type: "select", opts: ["", "Remote only", "Remote preferred, hybrid OK", "Hybrid", "Onsite OK", "Anything"] },
+  { k: "relocation", label: "Willing to relocate?", type: "select", opts: ["", "Yes", "No", "For the right role"] },
+  { k: "salary_expectation", label: "Salary expectation (range + currency)", ph: "e.g. $140–170k" },
+  { k: "notice_period", label: "Notice period / start date", ph: "e.g. 2 weeks" },
+  { k: "security_clearance", label: "Security clearance (if any)", ph: "e.g. none / Secret" },
+  { k: "preferred_name", label: "Preferred name (if different)", ph: "" },
+  { section: "Self-identification — optional. Used ONLY to pre-fill the EEO sections you'd fill anyway; “Prefer not to say” is always fine." },
+  { k: "gender", label: "Gender", type: "select", opts: ["", PNTS, "Male", "Female", "Non-binary"] },
+  { k: "race_ethnicity", label: "Race / ethnicity", type: "select", opts: ["", PNTS, "Asian", "Black or African American", "Hispanic or Latino", "White", "American Indian or Alaska Native", "Native Hawaiian or Other Pacific Islander", "Two or more races"] },
+  { k: "veteran_status", label: "Veteran status (US)", type: "select", opts: ["", PNTS, "I am not a protected veteran", "I identify as one or more of the classifications of a protected veteran"] },
+  { k: "disability_status", label: "Disability status", type: "select", opts: ["", PNTS, "No, I do not have a disability", "Yes, I have a disability (or previously had one)"] },
+  { k: "pronouns", label: "Pronouns", ph: "e.g. he/him" },
+  { section: "Your story" },
   { k: "superpower", label: "What sets you apart? Your professional superpower", ph: "The thing colleagues come to you for", wide: true },
   { k: "achievement_story", label: "Your proudest achievement — the story you'd lead with in an interview", ph: "Situation, what you did, the measurable result", wide: true, area: true },
   { k: "why_looking", label: "Why are you looking right now?", ph: "Your honest exit story — we'll phrase it well", wide: true },
@@ -408,22 +428,41 @@ const IV_FIELDS = [
 stages.interview = async () => {
   const { answers } = await api("/api/interview");
   state.interview = answers || {};
+  state.chatMsgs ||= [];
+  const joinVal = (v) => (Array.isArray(v) ? v.join(", ") : v || "");
+
+  const fieldHtml = (f) => {
+    if (f.section) return `<div style="grid-column:1/-1;margin-top:10px"><h3 style="font-size:14.5px">${esc(f.section)}</h3></div>`;
+    const val = joinVal(state.interview[f.k]);
+    return `
+      <div style="${f.wide ? "grid-column:1/-1;" : ""}${f.addr ? "position:relative;" : ""}">
+        <label class="field">${esc(f.label)}</label>
+        ${f.type === "select"
+          ? `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${val === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+          : f.area
+            ? `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(val)}</textarea>`
+            : `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(f.addr ? "" : val)}" autocomplete="off">`}
+        ${f.addr ? `<div class="addr-suggest" id="addr-suggest" hidden></div>` : ""}
+      </div>`;
+  };
+
   view.innerHTML = `
     <div class="stage stage-narrow">
       <div class="page-title">About you</div>
-      <p class="page-sub">Application forms ask the same things over and over — authorization, salary, notice, your story. Answer once here and every drafted application pulls from it. Locations you add appear on the globe and focus the job scan.</p>
+      <p class="page-sub">Application forms ask the same things over and over — authorization, salary, EEO questions, your story. Answer once, here, and every drafted application pulls from it. Talk it through in chat, or fill the form directly — they stay in sync.</p>
+
       <div class="card">
-        <div class="iv-grid">
-          ${IV_FIELDS.map((f) => `
-            <div style="${f.wide ? "grid-column:1/-1" : ""}">
-              <label class="field">${f.label}</label>
-              ${f.type === "select"
-                ? `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${state.interview[f.k] === o ? "selected" : ""}>${o}</option>`).join("")}</select>`
-                : f.area
-                  ? `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(joinVal(state.interview[f.k]))}</textarea>`
-                  : `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(joinVal(state.interview[f.k]))}">`}
-            </div>`).join("")}
+        <h3>Interview chat</h3>
+        <p class="hint">The companion asks what forms for <i>your</i> target roles actually ask — it reads real postings from your scan to know. Every fact you give is saved into the form below.</p>
+        <div id="chat-log" class="chat-log">${state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("") || `<div class="empty">Say hi, or ask “what do you need from me?”</div>`}</div>
+        <div class="row" style="margin-top:8px">
+          <input type="text" id="chat-in" placeholder="Type a message…" style="flex:1">
+          <button class="btn primary" id="chat-send">Send</button>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="iv-grid">${IV_FIELDS.map(fieldHtml).join("")}</div>
         <div class="row end" style="margin-top:16px">
           <span class="hint" style="margin-right:auto">Saved to your profile — user-layer, survives updates.</span>
           <button class="btn primary" id="iv-save">Save answers</button>
@@ -432,23 +471,90 @@ stages.interview = async () => {
       ${stageNav({ backTo: 2, onNext: true })}
     </div>`;
 
-  function joinVal(v) { return Array.isArray(v) ? v.join(", ") : v || ""; }
   const updateGlobe = () => bg().setCities([$("#iv-home_location").value, ...$("#iv-target_locations").value.split(",")].map((x) => x.trim()).filter(Boolean));
   ["home_location", "target_locations"].forEach((k) => $(`#iv-${k}`).addEventListener("input", updateGlobe));
   updateGlobe();
 
+  // ── Address autocomplete (keyless geocoder via the local server) ──
+  const addrIn = $("#iv-address_search");
+  const sug = $("#addr-suggest");
+  let addrTimer;
+  addrIn.addEventListener("input", () => {
+    clearTimeout(addrTimer);
+    const q = addrIn.value.trim();
+    if (q.length < 3) { sug.hidden = true; return; }
+    addrTimer = setTimeout(async () => {
+      try {
+        const { suggestions } = await api(`/api/geocode?q=${encodeURIComponent(q)}`);
+        sug.innerHTML = suggestions.length
+          ? suggestions.map((s, i) => `<div class="addr-opt" data-i="${i}">${esc(s.label)}</div>`).join("")
+          : `<div class="addr-opt" style="color:var(--faint)">no matches — keep typing or fill manually</div>`;
+        sug.hidden = false;
+        $$(".addr-opt[data-i]", sug).forEach((el) => el.addEventListener("mousedown", () => {
+          const s = suggestions[+el.dataset.i];
+          $("#iv-address_line1").value = s.line1;
+          $("#iv-address_city").value = s.city;
+          $("#iv-address_state").value = s.state;
+          $("#iv-address_postcode").value = s.postcode;
+          $("#iv-address_country").value = s.country;
+          addrIn.value = s.label;
+          sug.hidden = true;
+          toast("Address components filled — check the ZIP");
+        }));
+      } catch { sug.hidden = true; }
+    }, 350);
+  });
+  addrIn.addEventListener("blur", () => setTimeout(() => (sug.hidden = true), 250));
+
   const collect = () => {
     const a = {};
     for (const f of IV_FIELDS) {
+      if (f.section || f.addr) continue;
       const v = $(`#iv-${f.k}`).value.trim();
       a[f.k] = f.k === "target_locations" ? v.split(",").map((x) => x.trim()).filter(Boolean) : v;
     }
     return a;
   };
+  const refreshFromSaved = async () => {
+    const { answers: a2 } = await api("/api/interview");
+    state.interview = a2 || {};
+    for (const f of IV_FIELDS) {
+      if (f.section || f.addr) continue;
+      const el = $(`#iv-${f.k}`);
+      const v = joinVal(state.interview[f.k]);
+      if (v && el.value !== v) el.value = v;
+    }
+    updateGlobe();
+  };
+
+  // ── Chat ──
+  const sendChat = async () => {
+    const text = $("#chat-in").value.trim();
+    if (!text) return;
+    $("#chat-in").value = "";
+    state.chatMsgs.push({ role: "user", content: text });
+    const log = $("#chat-log");
+    log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
+    log.scrollTop = log.scrollHeight;
+    try {
+      const r = await api("/api/interview-chat", { method: "POST", body: { messages: state.chatMsgs } });
+      state.chatMsgs.push({ role: "assistant", content: r.reply });
+      log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("");
+      log.scrollTop = log.scrollHeight;
+      if (r.saved?.length) { await refreshFromSaved(); toast(`Saved: ${r.saved.join(", ")}`); }
+    } catch (e) {
+      state.chatMsgs.pop();
+      toast(e.message, true);
+      log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("");
+    }
+  };
+  $("#chat-send").addEventListener("click", sendChat);
+  $("#chat-in").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
   $("#iv-save").addEventListener("click", async () => {
     try {
       await api("/api/interview", { method: "POST", body: { answers: collect() } });
-      toast("Saved — the scanner is now location-aware too");
+      toast("Saved — the scanner and form-fill now know all of this");
     } catch (e) { toast(e.message, true); }
   });
   wireNav(2, async () => {

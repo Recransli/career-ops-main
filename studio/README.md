@@ -10,7 +10,7 @@ The whole thing is a **journey**, not a portal: Start → Model → Resume → a
 
 - **Bring your own model** — local Ollama (free, private, offline) or any OpenAI-compatible API: OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, LM Studio, vLLM, llama.cpp. Pick the provider, fetch the model list, select, done. Keys live only in `studio/.local/` on your machine (gitignored).
 - **Any-format resume** — PDF, DOCX, PNG/JPG (via your vision model), LaTeX, Markdown, or plain text. PDFs and DOCX are extracted *in your browser* (pdf.js / mammoth); everything is faithfully transcribed to markdown by your model, and **you review the conversion before it's saved** as `cv.md`, the single source of truth.
-- **The onboarding interview** — answer the questions every application asks (authorization, sponsorship, salary, notice, your story) exactly once. Every drafted application pulls from these answers plus your resume. Your locations make the scanner location-aware too.
+- **The onboarding interview** — answer everything applications ask, exactly once: authorization, sponsorship, salary, notice, relocation, clearance, your story, and *optional* self-identification (gender, race/ethnicity, veteran, disability — used only to pre-fill the EEO sections you'd fill anyway; "Prefer not to say" is always an answer). Do it as a form, or **talk it through in chat**: the companion reads real postings for your target role from your own scan and asks what those applications will actually want. Your **street address autocompletes** (keyless OSM geocoder) and fills city/state/ZIP/country as validated components.
 - **1,300+ searchable job roles** across 16 fields — pick your targets and the portal scanner's keywords and your profile are configured automatically.
 - **Zero-token job scanning** — hits Greenhouse/Lever/Ashby and 40+ other job-board APIs directly through career-ops' scanner. No AI cost to find openings.
 - **A job board that does the reading for you** — thousands of scanned postings with status tabs (Inbox / Evaluated / Applied), location and role filters, search and sorting. Pick a job and **the full posting loads by itself** from the Greenhouse/Lever/Ashby public APIs (page-text fallback for everything else) — no copy-pasting JDs. The workspace then offers four moves: **Evaluate** (full A–G report, fit score /5), **Tailor resume**, **Answers**, **Cover letter**. *"I applied"* asks for a quick note while it's fresh, tracks the job through career-ops' pipeline, and moves you on.
@@ -27,10 +27,15 @@ chrome://extensions → Developer mode → Load unpacked → select studio/exten
 
 Keep Studio running (`node studio/server.mjs`). On any application page, click the ✦ icon → **Fill this form**. Fields are drafted from your resume, profile, and interview answers, then highlighted orange for your review.
 
+The extension is **type-aware**: native selects get an option *selected*, radio groups get the matching option *clicked*, custom comboboxes (Greenhouse/react-select "Select…" widgets — even button-triggered ones) are opened, their real options read, and the match clicked like a human would, then **verified** — if the widget didn't register the choice it retries (type + Enter) and otherwise flags the field instead of leaving loose text. Resume/CV upload fields get your latest **tailored PDF attached automatically**. After filling, anything the page still marks invalid is highlighted for you.
+
 Safety is enforced server-side, not just prompted:
-- **Self-identification questions (race, gender, veteran status, disability…) are never auto-answered.**
-- Authorization, visa, salary, notice and start-date fields are only filled if *your* interview answers actually contain them — otherwise they're left blank instead of letting the model guess (models do guess; we tested).
+- **Your interview answers are authoritative.** Models reinterpret logistics (we caught one turning "2 weeks" into "30 days") — so authorization, sponsorship, salary, notice, relocation, clearance and self-ID fields are filled *verbatim* from your answers, corrected against them for choice fields, and left blank if you haven't answered.
+- Self-identification fills **only** from your explicit optional answers; orientation, religion, DOB, marital and criminal-history questions are never auto-answered at all.
+- Consent/certification checkboxes are never ticked for you.
 - Nothing is ever clicked or submitted. The extension fills and highlights, you review and send.
+
+A local test harness (`http://localhost:4949/test-form.html`) runs the exact shipping content script against a mock application form — native fields, comboboxes, radios, consent boxes, file upload — so every fill behavior above is verifiable on your machine.
 
 ## Quick start
 

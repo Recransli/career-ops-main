@@ -56,6 +56,24 @@ if (THREE) {
   scene.fog = new THREE.FogExp2(0xfaf9f5, 0.0105);
   const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 500);
 
+  // Round, softly-shaded sprite so every point renders as a tiny sphere
+  // instead of a hard square.
+  function discTexture() {
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const g = c.getContext("2d");
+    const grad = g.createRadialGradient(26, 24, 4, 32, 32, 30);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.55, "rgba(255,255,255,.85)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = grad;
+    g.beginPath();
+    g.arc(32, 32, 30, 0, Math.PI * 2);
+    g.fill();
+    return new THREE.CanvasTexture(c);
+  }
+  const DISC = discTexture();
+
   // The route: a gentle S-curve through the world. Camera and path both follow it.
   const pathX = (z) => Math.sin(z * 0.02) * 9;
 
@@ -77,7 +95,7 @@ if (THREE) {
   const tGeo = new THREE.BufferGeometry();
   tGeo.setAttribute("position", new THREE.BufferAttribute(tPos, 3));
   const terrain = new THREE.Points(tGeo, new THREE.PointsMaterial({
-    size: 0.55, color: 0xcbbfa8, transparent: true, opacity: 0.55, depthWrite: false,
+    size: 0.8, color: 0xcbbfa8, map: DISC, alphaTest: 0.15, transparent: true, opacity: 0.6, depthWrite: false,
   }));
   scene.add(terrain);
 
@@ -94,7 +112,7 @@ if (THREE) {
   const pGeo = new THREE.BufferGeometry();
   pGeo.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
   const path = new THREE.Points(pGeo, new THREE.PointsMaterial({
-    size: 0.9, color: 0xd97757, transparent: true, opacity: 0.85, depthWrite: false,
+    size: 1.15, color: 0xd97757, map: DISC, alphaTest: 0.15, transparent: true, opacity: 0.85, depthWrite: false,
   }));
   scene.add(path);
 
@@ -125,7 +143,7 @@ if (THREE) {
   const mGeo = new THREE.BufferGeometry();
   mGeo.setAttribute("position", new THREE.BufferAttribute(mPos, 3));
   const motes = new THREE.Points(mGeo, new THREE.PointsMaterial({
-    size: 0.5, color: 0xd9a288, transparent: true, opacity: 0.5, depthWrite: false,
+    size: 0.7, color: 0xd9a288, map: DISC, alphaTest: 0.15, transparent: true, opacity: 0.55, depthWrite: false,
   }));
   scene.add(motes);
 
@@ -141,7 +159,7 @@ if (THREE) {
   }
   const gGeo = new THREE.BufferGeometry();
   gGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(gpts), 3));
-  const gMat = new THREE.PointsMaterial({ size: 0.22, color: 0xb09a7e, transparent: true, opacity: 0 });
+  const gMat = new THREE.PointsMaterial({ size: 0.3, color: 0xb09a7e, map: DISC, alphaTest: 0.15, transparent: true, opacity: 0 });
   globe.add(new THREE.Points(gGeo, gMat));
   const markers = new THREE.Group();
   globe.add(markers);
@@ -213,8 +231,14 @@ if (THREE) {
     // Terrain breathes — slow rolling waves
     const pos = tGeo.attributes.position;
     for (let i = 0; i < tCount; i++) {
-      pos.array[i * 3 + 1] = -6 + Math.sin(tPhase[i] + t * 0.45) * 0.55
-        + Math.sin(pos.array[i * 3] * 0.05 + t * 0.2) * 0.9;
+      const x = pos.array[i * 3], z = pos.array[i * 3 + 2];
+      const dx = x - pathX(z);
+      const ahead = Math.max(0, camZ - z);                 // how far down the route
+      const well = -2.4 * Math.exp(-(dx * dx) / 750)       // valley along the path
+                   - Math.min(2.2, ahead * 0.008);          // sheet dips toward the sun
+      pos.array[i * 3 + 1] = -6 + well
+        + Math.sin(tPhase[i] + t * 0.45) * 0.5
+        + Math.sin(x * 0.05 + t * 0.2) * 0.8;
     }
     pos.needsUpdate = true;
 

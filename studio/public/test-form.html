@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Studio extension test form</title>
+<style>
+  body { font: 14px/1.6 -apple-system, sans-serif; max-width: 640px; margin: 30px auto; padding: 0 16px; }
+  .q { margin-bottom: 18px; }
+  label, legend { font-weight: 600; display: block; margin-bottom: 4px; }
+  input[type=text], input[type=email], input[type=tel], textarea, select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
+  /* fake react-select combobox */
+  .select-shell { position: relative; }
+  .select-shell input { cursor: default; }
+  .menu { position: absolute; left: 0; right: 0; top: 100%; background: #fff; border: 1px solid #ccc; border-radius: 6px; z-index: 5; display: none; }
+  .menu.open { display: block; }
+  .menu [role=option] { padding: 8px 10px; cursor: pointer; }
+  .menu [role=option]:hover { background: #eee; }
+  button#run { padding: 10px 20px; font-weight: 700; }
+</style>
+</head>
+<body>
+  <h2>Mock application form</h2>
+
+  <div class="q"><label for="name">Full name *</label><input type="text" id="name"></div>
+  <div class="q"><label for="email">Email *</label><input type="email" id="email"></div>
+  <div class="q"><label for="phone">Phone</label><input type="tel" id="phone"></div>
+  <div class="q"><label for="city">City</label><input type="text" id="city"></div>
+  <div class="q"><label for="zip">ZIP / Postal code</label><input type="text" id="zip"></div>
+  <div class="q"><label for="notice">What is your current notice period? *</label><input type="text" id="notice"></div>
+
+  <div class="q">
+    <label for="auth">Are you legally authorized to work in the United States? *</label>
+    <select id="auth"><option value="">Select...</option><option>Yes</option><option>No</option></select>
+  </div>
+
+  <div class="q select-shell">
+    <label id="cf-label">Do you have client facing experience in solution implementation or technical consulting? *</label>
+    <input type="text" role="combobox" aria-labelledby="cf-label" aria-autocomplete="list" aria-haspopup="listbox" id="clientfacing" placeholder="Select...">
+    <div class="menu" id="cf-menu" role="listbox">
+      <div role="option">Yes</div>
+      <div role="option">No</div>
+    </div>
+  </div>
+
+  <div class="q select-shell">
+    <label id="g-label">Gender (voluntary self-identification)</label>
+    <input type="text" role="combobox" aria-labelledby="g-label" aria-haspopup="listbox" id="gender" placeholder="Select...">
+    <div class="menu" id="g-menu" role="listbox">
+      <div role="option">Male</div>
+      <div role="option">Female</div>
+      <div role="option">Decline To Self Identify</div>
+    </div>
+  </div>
+
+  <div class="q select-shell">
+    <label id="co-label">Country *</label>
+    <button type="button" aria-haspopup="listbox" aria-labelledby="co-label" id="country" style="width:100%;text-align:left;padding:8px;border:1px solid #ccc;border-radius:6px;background:#fff">Select...</button>
+    <div class="menu" id="co-menu" role="listbox">
+      <div role="option">United States</div>
+      <div role="option">Canada</div>
+      <div role="option">India</div>
+      <div role="option">United Kingdom</div>
+    </div>
+  </div>
+
+  <div class="q">
+    <fieldset><legend>Would you need sponsorship now or in the future? *</legend>
+      <label><input type="radio" name="sponsor" value="y"> Yes</label>
+      <label><input type="radio" name="sponsor" value="n"> No</label>
+    </fieldset>
+  </div>
+
+  <div class="q"><label><input type="checkbox" id="consent"> I certify that my answers are true and accurate *</label></div>
+  <div class="q"><label for="resume">Resume *</label><input type="file" id="resume"></div>
+  <div class="q"><label for="why">Why do you want to work here?</label><textarea id="why" rows="4"></textarea></div>
+
+  <button id="run">▶ Run Studio fill (test)</button>
+  <pre id="state" style="background:#f5f5f5;padding:10px;border-radius:8px;margin-top:16px"></pre>
+
+<script>
+  // combobox behaviour like react-select: opens on click/arrow, filters on type
+  for (const [inp, menu] of [["clientfacing", "cf-menu"], ["gender", "g-menu"]].map(([a, b]) => [document.getElementById(a), document.getElementById(b)])) {
+    const open = () => menu.classList.add("open");
+    inp.addEventListener("click", open);
+    inp.addEventListener("keydown", (e) => { if (e.key === "ArrowDown") open(); if (e.key === "Escape") menu.classList.remove("open"); });
+    inp.addEventListener("input", () => {
+      open();
+      const q = inp.value.toLowerCase();
+      [...menu.children].forEach((o) => (o.style.display = o.textContent.toLowerCase().includes(q) ? "" : "none"));
+    });
+    menu.addEventListener("click", (e) => {
+      const opt = e.target.closest("[role=option]");
+      if (!opt) return;
+      inp.value = opt.textContent.trim();
+      inp.dataset.selected = opt.textContent.trim();
+      menu.classList.remove("open");
+    });
+  }
+
+  // button-triggered listbox (Greenhouse new-UI style)
+  {
+    const btn = document.getElementById("country"), menu = document.getElementById("co-menu");
+    btn.addEventListener("click", () => menu.classList.toggle("open"));
+    menu.addEventListener("click", (e) => {
+      const opt = e.target.closest("[role=option]");
+      if (!opt) return;
+      btn.textContent = opt.textContent.trim();
+      btn.dataset.selected = opt.textContent.trim();
+      menu.classList.remove("open");
+    });
+  }
+
+  // shim the extension environment: sendMessage → local Studio API
+  window.chrome = window.chrome || {};
+  chrome.runtime = {
+    sendMessage: async (msg) => {
+      if (msg.type === "resume-pdf") {
+        const r = await fetch("/api/latest-pdf");
+        const data = await r.json();
+        return { ok: r.ok && !data.error, ...data };
+      }
+      const r = await fetch("/api/autofill", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(msg.payload) });
+      const data = await r.json();
+      return { ok: r.ok && !data.error, ...data };
+    },
+  };
+
+  document.getElementById("run").addEventListener("click", () => {
+    const s = document.createElement("script");
+    s.src = "/ext/content.js?" + Date.now();
+    document.body.appendChild(s);
+  });
+
+  // live state readout for verification
+  window.reportState = () => ({
+    name: document.getElementById("name").value,
+    email: document.getElementById("email").value,
+    phone: document.getElementById("phone").value,
+    city: document.getElementById("city").value,
+    zip: document.getElementById("zip").value,
+    notice: document.getElementById("notice").value,
+    auth_select: document.getElementById("auth").value,
+    clientfacing_combo: document.getElementById("clientfacing").dataset.selected || document.getElementById("clientfacing").value,
+    gender_combo: document.getElementById("gender").dataset.selected || document.getElementById("gender").value,
+    sponsor_radio: document.querySelector('input[name=sponsor]:checked')?.value || "",
+    country_trigger: document.getElementById("country").dataset.selected || "",
+    consent_checked: document.getElementById("consent").checked,
+    resume_attached: document.getElementById("resume").files[0]?.name || "",
+    why: document.getElementById("why").value.slice(0, 80),
+  });
+</script>
+</body>
+</html>

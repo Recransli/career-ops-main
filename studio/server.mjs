@@ -718,6 +718,94 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Address autocomplete — keyless OSM geocoder (Photon), Nominatim fallback.
+  // Returns structured components so pincode/state/country populate themselves.
+  "GET /api/geocode": async (req, res, url) => {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (q.length < 3) return ok(res, { suggestions: [] });
+    try {
+      const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6&lang=en`);
+      if (!r.ok) throw new Error(`geocoder ${r.status}`);
+      const data = await r.json();
+      const suggestions = (data.features || []).map((f) => {
+        const p = f.properties || {};
+        const line1 = [p.housenumber, p.street || (p.type === "house" ? p.name : "")].filter(Boolean).join(" ") || (p.type !== "city" ? p.name : "");
+        return {
+          label: [line1, p.city || p.district, [p.state, p.postcode].filter(Boolean).join(" "), p.country].filter(Boolean).join(", "),
+          line1: line1 || "",
+          city: p.city || p.district || (p.type === "city" ? p.name : "") || "",
+          state: p.state || "",
+          postcode: p.postcode || "",
+          country: p.country || "",
+        };
+      }).filter((s) => s.label);
+      ok(res, { suggestions });
+    } catch (e) { fail(res, `Address lookup unavailable (${e.message}) — fill the fields manually.`, 502); }
+  },
+
+  // Conversational onboarding interview. The model plays recruiter: it knows
+  // the resume, the answers so far, and REAL postings for the user's target
+  // role (pulled live from the scanned pipeline), asks one question at a
+  // time, and persists facts via <<save {json}>> envelopes.
+  "POST /api/interview-chat": async (req, res) => {
+    const { messages } = await body(req);
+    if (!Array.isArray(messages) || !messages.length) return fail(res, "messages[] required");
+    try {
+      const profile = loadYaml(P.profile) || {};
+      const roles = profile.target_roles?.primary || [];
+      const cv = (read(P.cv) || "").slice(0, 2500);
+
+      // Ground the conversation in what THIS role's applications actually ask:
+      // sample up to 2 real postings for their top target role from the pipeline.
+      let postingCtx = "";
+      const topRole = roles[0];
+      if (topRole) {
+        const words = topRole.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+        const matches = parsePipeline().filter((i) => words.every((w) => i.title.toLowerCase().includes(w))).slice(0, 2);
+        for (const m of matches) {
+          const jd = await fetchJdFromUrl(m.url).catch(() => null);
+          if (jd?.text) postingCtx += `\n--- Real posting: ${jd.title} @ ${jd.company} (${jd.location}) ---\n${jd.text.slice(0, 1400)}\n`;
+        }
+      }
+
+      const SAVE_KEYS = "home_location, target_locations (array), remote_preference, work_authorization, needs_sponsorship, salary_expectation, notice_period, relocation, security_clearance, over_18, preferred_name, how_heard, superpower, achievement_story, why_looking, dealbreakers, gender, race_ethnicity, veteran_status, disability_status, pronouns, address_line1, address_city, address_state, address_postcode, address_country";
+
+      const raw = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are a warm, efficient onboarding interviewer inside a job-search companion app. Your job: learn everything application forms will ask this candidate, so the app can fill them later.
+
+CANDIDATE RESUME (excerpt):\n${cv}\n
+TARGET ROLES: ${roles.join(", ") || "not chosen yet"}\n
+ANSWERS ALREADY ON FILE (don't re-ask unless confirming): ${JSON.stringify(profile.interview || {})}
+${postingCtx ? `\nREAL POSTINGS for their target role — mine these for role-specific things applications will ask (requirements, timezone, clearances, client-facing expectations):\n${postingCtx}` : ""}
+
+RULES:
+- Ask ONE question per turn. Short, conversational, no bullet lists of questions.
+- Prioritize gaps in: what role/level they actually want → location & full address → work authorization & sponsorship → salary → notice/relocation → role-specific requirements you saw in the postings → their lead story → optional self-identification.
+- For self-identification (gender, race/ethnicity, veteran, disability, pronouns): explain it's optional, used only to pre-fill the EEO sections they'd fill anyway, and "prefer not to say" is a fine answer.
+- Whenever the user gives you a fact, persist it by appending on its own line: <<save {"key":"value"}>> (valid JSON, one line). Allowed keys: ${SAVE_KEYS}. Save aggressively — every concrete fact.
+- After ~8-12 exchanges or when coverage is good, summarize what you saved and say they can fine-tune in the form below.`,
+        },
+        ...messages.slice(-16),
+      ], { maxTokens: 900 });
+
+      // Extract and apply save envelopes, hide them from the visible reply.
+      const saved = {};
+      const reply = raw.replace(/<<save\s+(\{[^\n]*\})\s*>>/g, (_, json) => {
+        try { Object.assign(saved, JSON.parse(json)); } catch { /* skip bad json */ }
+        return "";
+      }).trim();
+      if (Object.keys(saved).length && yaml) {
+        ensureProfile();
+        const p2 = loadYaml(P.profile) || {};
+        p2.interview = { ...(p2.interview || {}), ...saved };
+        writeFileSync(P.profile, yaml.dump(p2, { lineWidth: 120 }));
+      }
+      ok(res, { reply, saved: Object.keys(saved) });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   "POST /api/fetch-jd": async (req, res) => {
     const { url } = await body(req);
     if (!/^https?:\/\//.test(url || "")) return fail(res, "valid url required");
@@ -804,6 +892,20 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Latest tailored PDF (optionally filtered by company slug) — the browser
+  // extension attaches this to Resume/CV upload fields via DataTransfer.
+  "GET /api/latest-pdf": async (req, res, url) => {
+    const q = slugify(url.searchParams.get("q") || "").slice(0, 30);
+    const dir = join(ROOT, "output");
+    if (!existsSync(dir)) return fail(res, "no PDFs generated yet", 404);
+    const pdfs = readdirSync(dir).filter((f) => f.endsWith(".pdf"))
+      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    const pick = (q && pdfs.find((p) => p.f.includes(q))) || pdfs[0];
+    if (!pick) return fail(res, "no PDFs generated yet — use Tailor → Generate PDF first", 404);
+    ok(res, { file: pick.f, b64: readFileSync(join(dir, pick.f)).toString("base64") });
+  },
+
   "GET /api/pdf-file": async (req, res, url) => {
     const f = basename(url.searchParams.get("f") || "");
     const p = join(ROOT, "output", f);
@@ -827,7 +929,7 @@ const routes = {
       const raw = await chat(loadSettings(), [
         {
           role: "system",
-          content: `You fill job-application form fields for a candidate.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRules per field TYPE — respect the type exactly:\n- select / radio: value MUST be copied VERBATIM from that field's options list. Pick the option matching the candidate's profile; if none clearly matches, "".\n- checkbox: return "Yes" ONLY when the profile clearly affirms the labelled statement; otherwise "". Never "Yes" for consent/certification/terms boxes.\n- text / email / tel / url: the exact value from the profile (email as-is, phone as-is).\n- date: ISO format YYYY-MM-DD, only if derivable from the profile; else "".\n- number: digits only.\n- textarea (long answers): 60-140 words, grounded in the resume, specific.\nGeneral:\n- Contact fields come from the profile. Authorization/sponsorship/salary/notice come from the interview block in the profile.\n- If the resume/profile doesn't contain the needed fact, return "" for that field. NEVER guess or invent.\n- Output STRICT JSON only: [{"id": "<field id>", "value": "<value>"}]`,
+          content: `You fill job-application form fields for a candidate.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRules per field TYPE — respect the type exactly:\n- select / radio: value MUST be copied VERBATIM from that field's options list. Pick the option matching the candidate's profile; if none clearly matches, "".\n- checkbox: return "Yes" ONLY when the profile clearly affirms the labelled statement; otherwise "". Never "Yes" for consent/certification/terms boxes.\n- text / email / tel / url: the exact value from the profile (email as-is, phone as-is).\n- date: ISO format YYYY-MM-DD, only if derivable from the profile; else "".\n- number: digits only.\n- textarea (long answers): 60-140 words, grounded in the resume, specific.\nGeneral:\n- Contact fields come from the profile. Authorization/sponsorship/salary/notice come from the interview block in the profile.\n- Country/state/city fields MAY be derived from the profile's stated locations (a US state as home_location implies country United States) — derivation from stated facts is fine; invention is not.\n- If the resume/profile doesn't contain or imply the needed fact, return "" for that field. NEVER guess or invent.\n- Output STRICT JSON only: [{"id": "<field id>", "value": "<value>"}]`,
         },
         {
           role: "user",
@@ -843,21 +945,52 @@ const routes = {
       // allowed through when the user's interview actually provides them, and
       // demographic/EEO questions are never auto-answered at all.
       const interview = (loadYaml(P.profile) || {}).interview || {};
+      // Sensitive fields only pass through when the user's own interview
+      // answers provide them — including self-identification, which fills
+      // ONLY from the explicit optional answers in About You.
       const SENSITIVE = [
         { re: /citizen|authoriz|right to work|work permit/i, key: "work_authorization" },
         { re: /sponsor|visa/i, key: "needs_sponsorship" },
         { re: /salary|compensation|pay expectation|desired pay|expected pay|rate/i, key: "salary_expectation" },
         { re: /notice period|start date|available to start|availability/i, key: "notice_period" },
+        { re: /relocat/i, key: "relocation" },
+        { re: /clearance/i, key: "security_clearance" },
+        { re: /18|age of majority|legal age/i, key: "over_18" },
+        { re: /gender|sex\b/i, key: "gender" },
+        { re: /race|ethnic/i, key: "race_ethnicity" },
+        { re: /veteran/i, key: "veteran_status" },
+        { re: /disabilit/i, key: "disability_status" },
+        { re: /pronoun/i, key: "pronouns" },
       ];
-      const NEVER = /race|ethnic|gender|sex\b|veteran|disabilit|orientation|religio|pronoun|age\b|date of birth/i;
-      const labelOf = Object.fromEntries(fields.map((f) => [f.id, f.label || ""]));
+      const NEVER = /orientation|religio|date of birth|marital|criminal|conviction/i;
+      const fieldOf = Object.fromEntries(fields.map((f) => [f.id, f]));
       for (const v of values) {
-        const label = labelOf[v.id] || "";
-        if (NEVER.test(label)) { v.value = ""; v.blocked = "self-identification — answer this yourself"; continue; }
+        const f = fieldOf[v.id] || {};
+        const label = f.label || "";
+        if (NEVER.test(label)) { v.value = ""; v.blocked = "answer this one yourself"; continue; }
         const s = SENSITIVE.find((x) => x.re.test(label));
-        if (s && !String(interview[s.key] || "").trim()) {
+        if (!s) continue;
+        const answer = String(interview[s.key] || "").trim();
+        if (!answer) {
           v.value = "";
-          v.blocked = "not in your interview answers — complete the About You step or fill manually";
+          v.blocked = "not in your About You answers — fill it there once or answer manually";
+          continue;
+        }
+        // The user's own answer is AUTHORITATIVE — models reinterpret these
+        // (verified: returned "30 days" against a stated "2 weeks").
+        const hasOptions = Array.isArray(f.options) && f.options.length;
+        if (!hasOptions && !["checkbox", "radio"].includes(f.type)) {
+          v.value = answer; // free-text: copy verbatim
+        } else if (hasOptions) {
+          // Choice field: model's pick must be consistent with the answer;
+          // if the answer plainly matches a different option, correct it.
+          const norm = (x) => String(x).toLowerCase().trim();
+          const direct = f.options.find((o) => norm(o) === norm(answer))
+            || f.options.find((o) => norm(o).includes(norm(answer)) || norm(answer).includes(norm(o)));
+          const yesNo = /^(yes|no)\b/i.exec(answer);
+          const byPolarity = yesNo ? f.options.find((o) => new RegExp(`^${yesNo[1]}\\b`, "i").test(o)) : null;
+          const corrected = direct || byPolarity;
+          if (corrected && norm(corrected) !== norm(v.value)) v.value = corrected;
         }
       }
       ok(res, { values: values.filter((v) => v && v.id) });
@@ -1004,6 +1137,12 @@ const server = http.createServer(async (req, res) => {
   try {
     if (routes[key]) return await routes[key](req, res, url);
     if (url.pathname.startsWith("/api/")) return fail(res, "not found", 404);
+
+    // Serve the extension's content script for the local test harness
+    // (public/test-form.html) so the exact shipping code gets exercised.
+    if (url.pathname === "/ext/content.js") {
+      return send(res, 200, readFileSync(join(STUDIO, "extension", "content.js")), "text/javascript");
+    }
 
     // static files
     const file = url.pathname === "/" ? "/index.html" : url.pathname;
