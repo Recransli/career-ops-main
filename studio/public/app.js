@@ -99,6 +99,7 @@ const STAGES = [
   { id: "roles", label: "Roles" },
   { id: "scan", label: "Discover" },
   { id: "board", label: "Apply" },
+  { id: "track", label: "Track" },
 ];
 
 function renderRail() {
@@ -553,59 +554,159 @@ function guessCompany(item) {
   return m ? m[1].replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : (item.title.split(/[—–|@]/)[1] || "").trim();
 }
 let railFilter = "";
+const railState = { loc: "", role: "", tab: "inbox", sort: "default" };
 const wsFor = (id) => (state.ws[id] ||= { jd: "", tab: "evaluate", company: "", role: "", report: null, reportPath: null, score: null, advice: null, answers: null, letter: null });
 
 stages.board = async () => {
   await Promise.all([loadJobs(), loadCatalog()]);
   view.innerHTML = `
     <div class="stage">
-      <div class="page-title">Applications</div>
-      <p class="page-sub">Work through one job at a time: evaluate the fit, generate a tailored PDF resume, draft answers and a letter — then apply and move to the next. On the posting itself, the <b>browser extension</b> fills the form from here (see <code>studio/extension</code>).</p>
+      <div class="row">
+        <div style="flex:1;min-width:0">
+          <div class="page-title">Applications</div>
+          <p class="page-sub">The posting loads by itself when you pick a job — evaluate, generate the tailored PDF, draft answers, apply, next. On the form itself, the <b>browser extension</b> fills the fields from here.</p>
+        </div>
+        <button class="btn" id="to-track">Applied jobs →</button>
+      </div>
       <div class="board">
         <aside class="job-rail" id="rail"></aside>
         <section class="workspace" id="ws"></section>
       </div>
     </div>`;
+  $("#to-track").addEventListener("click", () => go(7));
   renderRail6();
   renderWorkspace();
 };
 
+function roleWords(role) {
+  return role.toLowerCase().split(/\s+/).filter((w) => w.length > 3 && !/^(senior|junior|staff|principal|lead|associate)$/.test(w));
+}
+
+function topLocations(jobs) {
+  const counts = {};
+  for (const j of jobs) {
+    const loc = (j.location || "").trim();
+    if (loc) counts[loc] = (counts[loc] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 18);
+}
+
 function renderRail6() {
   const rail = $("#rail");
-  const CAP = 120;
+  const CAP = 100;
   const terms = railFilter.toLowerCase().split(/\s+/).filter(Boolean);
-  const match = (j) => !terms.length || terms.every((t) => `${j.title} ${j.company} ${j.location || ""}`.toLowerCase().includes(t));
-  const inboxAll = state.jobs.filter((j) => j.status === "Inbox" && match(j));
-  const tracked = state.jobs.filter((j) => j.status !== "Inbox" && match(j));
-  const inbox = inboxAll.slice(0, CAP);
+  const match = (j) => {
+    if (terms.length && !terms.every((t) => `${j.title} ${j.company} ${j.location || ""}`.toLowerCase().includes(t))) return false;
+    if (railState.loc) {
+      const l = (j.location || "").toLowerCase();
+      if (railState.loc === "__remote" ? !/remote/i.test(`${j.location} ${j.title}`) : l !== railState.loc.toLowerCase()) return false;
+    }
+    if (railState.role && !roleWords(railState.role).every((w) => j.title.toLowerCase().includes(w))) return false;
+    return true;
+  };
+  const byTab = {
+    inbox: (j) => j.status === "Inbox",
+    progress: (j) => j.status !== "Inbox" && !["Applied", "Responded", "Interview", "Offer"].includes(j.status),
+    applied: (j) => ["Applied", "Responded", "Interview", "Offer"].includes(j.status),
+    all: () => true,
+  };
+  let list = state.jobs.filter((j) => match(j) && byTab[railState.tab](j));
+  if (railState.sort === "company") list = [...list].sort((a, b) => (a.company || "").localeCompare(b.company || ""));
+  if (railState.sort === "title") list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+  if (railState.sort === "score") list = [...list].sort((a, b) => (parseFloat(b.score) || 0) - (parseFloat(a.score) || 0));
+  const total = list.length;
+  list = list.slice(0, CAP);
+
+  const counts = {
+    inbox: state.jobs.filter(byTab.inbox).length,
+    progress: state.jobs.filter(byTab.progress).length,
+    applied: state.jobs.filter(byTab.applied).length,
+  };
   const card = (j) => `
     <div class="job-card ${state.activeJob === j.id ? "active" : ""}" data-id="${j.id}">
       <div class="jc-title">${esc(j.title)}</div>
       <div class="jc-meta">
-        ${j.status !== "Inbox" ? `<span class="pill ${j.status === "Applied" ? "ok" : "off"}">${esc(j.status)}</span>` : ""}
+        ${j.status !== "Inbox" ? `<span class="pill ${["Applied", "Interview", "Offer"].includes(j.status) ? "ok" : "off"}">${esc(j.status)}</span>` : ""}
         ${j.score && j.score !== "-" ? `<span>${esc(j.score)}</span>` : ""}
         ${j.company ? `<span>${esc(j.company)}</span>` : ""}
-        ${j.location ? `<span>· ${esc(j.location)}</span>` : ""}
+        ${j.location ? `<span>· ${esc(j.location.slice(0, 26))}</span>` : ""}
       </div>
     </div>`;
+
   rail.innerHTML = `
-    <input type="text" id="rail-q" placeholder="Filter ${state.jobs.length.toLocaleString()} jobs…" value="${esc(railFilter)}" style="margin-bottom:8px">
-    ${tracked.length ? `<div class="rail-head">In progress · ${tracked.length}</div>` + tracked.map(card).join("") : ""}
-    ${inbox.length ? `<div class="rail-head">Inbox · ${inboxAll.length.toLocaleString()}${inboxAll.length > CAP ? ` (showing ${CAP} — filter to narrow)` : ""}</div>` + inbox.map(card).join("") : ""}
-    ${!state.jobs.length ? `<div class="empty">No jobs yet — run a scan, or add one below.</div>` : ""}
+    <div class="ws-tabs" style="margin:0 0 8px">
+      ${[["inbox", `Inbox ${counts.inbox.toLocaleString()}`], ["progress", `Evaluated ${counts.progress}`], ["applied", `Applied ${counts.applied}`], ["all", "All"]]
+        .map(([id, l]) => `<button class="ws-tab ${railState.tab === id ? "active" : ""}" data-rtab="${id}">${l}</button>`).join("")}
+    </div>
+    <input type="text" id="rail-q" placeholder="Search title, company…" value="${esc(railFilter)}" style="margin-bottom:6px">
+    <div class="row" style="gap:6px;margin-bottom:8px">
+      <select id="rail-loc" style="flex:1;font-size:12.5px;padding:6px 8px">
+        <option value="">All locations</option>
+        <option value="__remote" ${railState.loc === "__remote" ? "selected" : ""}>Remote</option>
+        ${topLocations(state.jobs).map(([l, n]) => `<option value="${esc(l)}" ${railState.loc === l ? "selected" : ""}>${esc(l.slice(0, 28))} (${n})</option>`).join("")}
+      </select>
+      <select id="rail-role" style="flex:1;font-size:12.5px;padding:6px 8px">
+        <option value="">All my roles</option>
+        ${state.selectedRoles.map((r) => `<option ${railState.role === r ? "selected" : ""}>${esc(r)}</option>`).join("")}
+      </select>
+      <select id="rail-sort" style="font-size:12.5px;padding:6px 8px">
+        ${[["default", "Sort"], ["company", "Company A–Z"], ["title", "Title A–Z"], ["score", "Score"]]
+          .map(([v, l]) => `<option value="${v}" ${railState.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+      </select>
+    </div>
+    <div class="rail-head">${total.toLocaleString()} match${total === 1 ? "" : "es"}${total > CAP ? ` · showing ${CAP}` : ""}</div>
+    ${list.map(card).join("") || `<div class="empty">Nothing here — adjust the filters or run a scan.</div>`}
     <button class="btn small" id="add-job" style="width:100%;justify-content:center;margin-top:6px">+ Add a job manually</button>`;
+
+  $$("#rail [data-rtab]").forEach((b) => b.addEventListener("click", () => { railState.tab = b.dataset.rtab; renderRail6(); }));
   const q = $("#rail-q");
   q.addEventListener("input", () => { railFilter = q.value; const pos = q.selectionStart; renderRail6(); const nq = $("#rail-q"); nq.focus(); nq.setSelectionRange(pos, pos); });
+  $("#rail-loc").addEventListener("change", (e) => { railState.loc = e.target.value; renderRail6(); });
+  $("#rail-role").addEventListener("change", (e) => { railState.role = e.target.value; renderRail6(); });
+  $("#rail-sort").addEventListener("change", (e) => { railState.sort = e.target.value; renderRail6(); });
   $$("#rail .job-card").forEach((c) => c.addEventListener("click", () => { state.activeJob = c.dataset.id; renderRail6(); renderWorkspace(); }));
   $("#add-job").addEventListener("click", () => {
     const id = `m-${Date.now()}`;
     state.jobs.unshift({ id, title: "New application", url: null, company: "", role: "", status: "Inbox" });
     state.activeJob = id;
+    railState.tab = "inbox";
     renderRail6(); renderWorkspace();
   });
 }
 
 function scoreOf(report) { return report ? parseFloat((report.match(/(\d(?:\.\d)?)\s*\/\s*5/) || [])[1]) || null : null; }
+
+// The posting, as close to the original as we can get it — fetched from the
+// ATS API (rich HTML) or page text, with manual paste only as a last resort.
+function jdBlock(job, w) {
+  if (!job.url && !w.jd) {
+    return `<label class="field">Job description</label>
+      <textarea id="w-jd" style="min-height:120px" placeholder="No posting URL for this one — paste the JD text">${esc(w.jd)}</textarea>`;
+  }
+  if (w.jdStatus === "loading") {
+    return `<div class="posting"><div class="empty"><span class="spinner"></span> Retrieving the posting…</div></div>`;
+  }
+  if (w.jdStatus === "failed" && !w.jd) {
+    return `<div class="note">Couldn't fetch this posting automatically (${esc(w.jdErr || "")}). <button class="btn small" id="jd-retry">Retry</button></div>
+      <label class="field">Job description</label>
+      <textarea id="w-jd" style="min-height:120px" placeholder="Paste the JD text here">${esc(w.jd)}</textarea>`;
+  }
+  const body = w.jdHtml
+    ? `<div class="posting-body prose">${w.jdHtml}</div>`
+    : `<div class="posting-body" style="white-space:pre-wrap">${esc(w.jd)}</div>`;
+  return `
+    <div class="posting">
+      <div class="row" style="margin-bottom:6px">
+        <span class="pill ok" style="margin-right:auto">${esc(w.jdSource === "page-text" ? "retrieved from page" : "live from " + (w.jdSource || "posting").replace("-api", ""))}</span>
+        ${w.location ? `<span class="pill off">${esc(w.location)}</span>` : ""}
+        <button class="btn small" id="jd-retry">↻</button>
+      </div>
+      ${body}
+    </div>
+    <details style="margin-top:8px"><summary class="hint" style="cursor:pointer">Edit JD text (what the AI reads)</summary>
+      <textarea id="w-jd" style="min-height:120px;margin-top:6px">${esc(w.jd)}</textarea>
+    </details>`;
+}
 
 function renderWorkspace() {
   const wsEl = $("#ws");
@@ -614,6 +715,27 @@ function renderWorkspace() {
   const w = wsFor(job.id);
   w.company ||= job.company || ""; w.role ||= job.role || "";
   const score = w.score ?? (job.score ? parseFloat(job.score) : null);
+
+  // Auto-retrieve the posting — the user should never have to paste a JD.
+  if (job.url && w.jdStatus === undefined) {
+    w.jdStatus = "loading";
+    api("/api/fetch-jd", { method: "POST", body: { url: job.url } })
+      .then((r) => {
+        w.jdStatus = "ok";
+        w.jd = w.jd || r.text;
+        w.jdHtml = r.html;
+        w.jdSource = r.source;
+        if (!w.company && r.company) w.company = r.company.replace(/\b\w/g, (c) => c.toUpperCase());
+        if ((!w.role || w.role === job.title) && r.title) w.role = r.title;
+        w.location = r.location || job.location || "";
+        if (state.activeJob === job.id) renderWorkspace();
+      })
+      .catch((e) => {
+        w.jdStatus = "failed";
+        w.jdErr = e.message;
+        if (state.activeJob === job.id) renderWorkspace();
+      });
+  }
 
   const TABS = [["evaluate", "Evaluate"], ["tailor", "Tailor resume"], ["answers", "Answers"], ["letter", "Cover letter"]];
   wsEl.innerHTML = `
@@ -631,8 +753,7 @@ function renderWorkspace() {
         <div><label class="field">Company</label><input type="text" id="w-company" value="${esc(w.company)}"></div>
         <div><label class="field">Role title</label><input type="text" id="w-role" value="${esc(w.role)}" placeholder="e.g. ${esc(state.selectedRoles[0] || "Machine Learning Engineer")}"></div>
       </div>
-      <label class="field">Job description ${job.url ? `<span style="font-weight:400;color:var(--faint)">— open the posting and paste the JD text</span>` : ""}</label>
-      <textarea id="w-jd" style="min-height:120px" placeholder="Paste the full JD — it powers all four tabs below">${esc(w.jd)}</textarea>
+      ${jdBlock(job, w)}
       <div class="ws-tabs">${TABS.map(([id, l]) => `<button class="ws-tab ${w.tab === id ? "active" : ""}" data-tab="${id}">${l}</button>`).join("")}</div>
       <div id="tab-body"></div>
     </div>
@@ -640,8 +761,9 @@ function renderWorkspace() {
 
   $("#w-company").addEventListener("input", (e) => (w.company = e.target.value));
   $("#w-role").addEventListener("input", (e) => (w.role = e.target.value));
-  $("#w-jd").addEventListener("input", (e) => (w.jd = e.target.value));
-  $$(".ws-tab").forEach((t) => t.addEventListener("click", () => { w.tab = t.dataset.tab; renderWorkspace(); }));
+  $("#w-jd")?.addEventListener("input", (e) => (w.jd = e.target.value));
+  $("#jd-retry")?.addEventListener("click", () => { w.jdStatus = undefined; renderWorkspace(); });
+  $$("#ws .ws-tab[data-tab]").forEach((t) => t.addEventListener("click", () => { w.tab = t.dataset.tab; renderWorkspace(); }));
 
   $("#mark-applied").addEventListener("click", () => trackJob(job, w, "Applied"));
   $("#mark-skip").addEventListener("click", () => trackJob(job, w, "SKIP"));
@@ -751,18 +873,109 @@ function questionsForRole(roleTitle) {
 async function trackJob(job, w, status) {
   if (!w.company || !w.role) return toast("Fill in company and role title first", true);
   if (status === "Applied" && w.score !== null && w.score < 4 && !confirm(`This scored ${w.score}/5 — below the apply bar. Mark as applied anyway?`)) return;
+  // Feedback loop: capture what happened at submit time while it's fresh —
+  // it lands in the tracker notes and future you (and Track) will see it.
+  let note = "";
+  if (status === "Applied") {
+    note = prompt("Applied ✓ — any notes while it's fresh? (fields the form asked that surprised you, referral used, salary you entered… optional)") || "";
+    note = note ? `applied via Studio — ${note}` : "applied via Studio (manually submitted)";
+  }
   try {
     const r = await api("/api/track", { method: "POST", body: {
       company: w.company, role: w.role, status,
-      score: w.score, reportPath: w.reportPath, note: status === "Applied" ? "applied via Studio (manually submitted)" : "",
+      score: w.score, reportPath: w.reportPath, note,
     }});
-    toast(status === "Applied" ? `Tracked as Applied (#${r.num}) — onward!` : "Skipped — onward!");
+    toast(status === "Applied" ? `Tracked as Applied (#${r.num}) — it's now in Track` : "Skipped — onward!");
     const idx = state.jobs.findIndex((j) => j.id === job.id);
     await loadJobs();
     state.activeJob = state.jobs[Math.min(idx, state.jobs.length - 1)]?.id || null;
     renderRail6(); renderWorkspace();
   } catch (e) { toast(e.message, true); }
 }
+
+/* 7 — Track: everything after you hit submit */
+stages.track = async () => {
+  const [{ rows }, { cadence }, { plugins }] = await Promise.all([
+    api("/api/tracker"), api("/api/followups"), api("/api/plugins"),
+  ]);
+  const applied = rows.filter((r) => ["Applied", "Responded", "Interview", "Offer"].includes(r.status));
+  const days = (d) => Math.max(0, Math.round((Date.now() - new Date(d)) / 86400000));
+  const cadenceFor = (company) => {
+    const list = cadence?.followups || cadence?.applications || (Array.isArray(cadence) ? cadence : []);
+    return list.find?.((c) => (c.company || "").toLowerCase() === company.toLowerCase());
+  };
+  const gmail = plugins.find((p) => p.id === "gmail");
+  const NEXT = { Applied: "Responded", Responded: "Interview", Interview: "Offer" };
+
+  view.innerHTML = `
+    <div class="stage">
+      <div class="row">
+        <div style="flex:1">
+          <div class="page-title">Your applications</div>
+          <p class="page-sub">Everything you've applied to, with follow-up timing and interview prep. Update a status the moment you hear back — the whole system learns from it.</p>
+        </div>
+        <button class="btn" id="back-board">← Apply board</button>
+      </div>
+      ${applied.length ? applied.map((r) => {
+        const c = cadenceFor(r.company);
+        const d = days(r.date);
+        return `
+        <div class="card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
+          <div class="row">
+            <div style="flex:1;min-width:0">
+              <h3 style="margin-bottom:2px">${esc(r.role)} — ${esc(r.company)}</h3>
+              <span class="hint">applied ${esc(r.date)} · ${d} day${d === 1 ? "" : "s"} ago${r.score && r.score !== "-" ? ` · fit ${esc(r.score)}` : ""}</span>
+            </div>
+            <span class="pill ${r.status === "Applied" ? "off" : "ok"}">${esc(r.status)}</span>
+          </div>
+          ${c?.next_action || c?.action ? `<div class="note" style="margin:10px 0 4px">Follow-up: ${esc(c.next_action || c.action)}${c.due || c.next_date ? ` · ${esc(c.due || c.next_date)}` : ""}</div>`
+            : d >= 7 && r.status === "Applied" ? `<div class="note" style="margin:10px 0 4px">${d} days with no response — a short, polite follow-up is reasonable now.</div>` : ""}
+          <div class="row" style="margin-top:10px">
+            <button class="btn small primary" data-prep>Prep plan</button>
+            ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back → ${NEXT[r.status]}</button>` : ""}
+            ${r.status !== "Offer" ? `<button class="btn small" data-status="Rejected">Rejected</button>` : ""}
+          </div>
+          <div class="prep-out" style="margin-top:10px"></div>
+          ${r.notes ? `<p class="hint" style="margin-top:8px">${esc(r.notes)}</p>` : ""}
+        </div>`;
+      }).join("") : `<div class="card"><div class="empty">Nothing applied yet — when you hit “I applied” on the board, jobs land here.</div></div>`}
+      <div class="card">
+        <h3>Inbox monitoring (Gmail)</h3>
+        ${gmail?.enabled
+          ? `<p class="hint">Gmail plugin enabled — pull job-related email leads into your pipeline.</p><button class="btn" id="gmail-run">Pull from Gmail</button><div id="gmail-out"></div>`
+          : `<p class="hint">career-ops ships a read-only Gmail plugin: label the recruiter emails in Gmail and it pulls them into your pipeline, so responses never slip through. To enable: set <code>gmail: enabled</code> in <code>config/plugins.yml</code> and add ${esc((gmail?.missingEnv || ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]).join(", "))} to <code>.env</code> (your own OAuth credentials — nothing is shared). Then this card becomes a one-click inbox check.</p>`}
+      </div>
+    </div>`;
+
+  $("#back-board").addEventListener("click", () => go(6));
+  $$("#view [data-prep]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".card");
+    const out = card.querySelector(".prep-out");
+    b.disabled = true;
+    out.innerHTML = `<div class="empty">${spin} Building your prep plan — gaps, study plan, likely questions…</div>`;
+    try {
+      const r = await api("/api/prep", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role } });
+      out.innerHTML = `<div class="note">Saved to <code>${esc(r.file)}</code> — the career-ops interview modes read this too.</div><div class="prose">${md(r.plan)}</div>`;
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+    b.disabled = false;
+  }));
+  $$("#view [data-status]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".card");
+    try {
+      await api("/api/track", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role, status: b.dataset.status } });
+      toast(`${card.dataset.co} → ${b.dataset.status}`);
+      stages.track();
+    } catch (e) { toast(e.message, true); }
+  }));
+  $("#gmail-run")?.addEventListener("click", async () => {
+    const out = $("#gmail-out");
+    out.innerHTML = `<div class="empty">${spin} Checking your labelled inbox…</div>`;
+    try {
+      const r = await api("/api/gmail-pull", { method: "POST", body: {} });
+      out.innerHTML = `<pre class="log">${esc(r.output)}</pre>`;
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+  });
+};
 
 /* ── overlays (Reports / Model settings) ───────────────── */
 const overlays = {
@@ -797,8 +1010,9 @@ $("#overlay").addEventListener("click", (e) => { if (e.target.id === "overlay") 
     const iv = await api("/api/interview").then((r) => r.answers || {}).catch(() => ({}));
     const done = [true, !!s.settings.model, s.cv, Object.keys(iv).some((k) => iv[k]?.length), s.portals && s.profile, s.pipeline > 0 || s.reports > 0];
     let first = done.findIndex((d) => !d);
-    if (first === -1) first = 6;
-    state.maxStage = Math.max(first, 0);
+    const allDone = first === -1;
+    if (allDone) first = 6;
+    state.maxStage = allDone ? 7 : Math.max(first, 0);
     renderRail();
     go(first <= 1 && !s.cv ? 0 : first);
   } catch (e) {

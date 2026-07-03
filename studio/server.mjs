@@ -329,6 +329,105 @@ async function trackApplication({ company, role, status, score, reportPath, note
 }
 
 // ---------------------------------------------------------------------------
+// JD auto-fetch — ATS public APIs first (same rung check-liveness uses),
+// generic page fetch as fallback. The user never pastes a JD by hand.
+// ---------------------------------------------------------------------------
+function decodeEntities(s) {
+  return String(s || "")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&");
+}
+
+// Postings are third-party content rendered in our UI — strip anything active.
+function sanitizeHtml(html) {
+  return String(html || "")
+    .replace(/<(script|style|iframe|object|embed|form|link|meta)\b[\s\S]*?(<\/\1>|\/?>)/gi, "")
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/(href|src)\s*=\s*(["']?)\s*javascript:[^"'\s>]*\2/gi, "");
+}
+
+function htmlToText(html) {
+  return decodeEntities(
+    String(html || "")
+      .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/tr)\b[^>]*>/gi, "\n")
+      .replace(/<li\b[^>]*>/gi, "• ")
+      .replace(/<[^>]+>/g, " ")
+  ).replace(/[ \t]+/g, " ").replace(/\n\s+/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+const jdCache = new Map(); // url → {title, company, location, html, text, source}
+
+async function fetchJdFromUrl(url) {
+  if (jdCache.has(url)) return jdCache.get(url);
+  const u = new URL(url);
+  let out = null;
+
+  try {
+    if (/(^|\.)greenhouse\.io$/.test(u.hostname)) {
+      const m = u.pathname.match(/\/([^/]+)\/jobs\/(\d+)/);
+      if (m) {
+        const region = u.hostname.includes(".eu.") ? ".eu" : "";
+        for (const api of [
+          `https://boards-api${region}.greenhouse.io/v1/boards/${m[1]}/jobs/${m[2]}`,
+          `https://boards-api.greenhouse.io/v1/boards/${m[1]}/jobs/${m[2]}`,
+        ]) {
+          const r = await fetch(api).catch(() => null);
+          if (!r?.ok) continue;
+          const j = await r.json();
+          const html = sanitizeHtml(decodeEntities(j.content));
+          out = { title: j.title, company: m[1].replace(/-/g, " "), location: j.location?.name || "", html, text: htmlToText(html), source: "greenhouse-api" };
+          break;
+        }
+      }
+    } else if (u.hostname === "jobs.lever.co") {
+      const [, slug, id] = u.pathname.split("/");
+      if (slug && id) {
+        const r = await fetch(`https://api.lever.co/v0/postings/${slug}/${id}`).catch(() => null);
+        if (r?.ok) {
+          const j = await r.json();
+          const lists = (j.lists || []).map((l) => `<h3>${l.text}</h3><ul>${l.content}</ul>`).join("");
+          const html = sanitizeHtml(`${j.description || ""}${lists}${j.additional || ""}`);
+          out = { title: j.text, company: slug, location: j.categories?.location || "", html, text: htmlToText(html), source: "lever-api" };
+        }
+      }
+    } else if (u.hostname === "jobs.ashbyhq.com") {
+      const [, org, jobId] = u.pathname.split("/");
+      if (org && jobId) {
+        const r = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${org}?includeCompensation=true`).catch(() => null);
+        if (r?.ok) {
+          const j = await r.json();
+          const job = (j.jobs || []).find((x) => x.id === jobId || url.includes(x.id));
+          if (job) {
+            const html = sanitizeHtml(job.descriptionHtml || "");
+            out = { title: job.title, company: org, location: job.location || "", html, text: job.descriptionPlain || htmlToText(html), source: "ashby-api" };
+          }
+        }
+      }
+    }
+
+    // Generic fallback: fetch the page, keep readable text. JS-rendered pages
+    // may come back thin — the UI falls back to manual paste in that case.
+    if (!out) {
+      const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (career-ops-studio)" }, redirect: "follow" }).catch(() => null);
+      if (r?.ok) {
+        const page = await r.text();
+        const title = htmlToText((page.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
+        const bodyMatch = page.match(/<main\b[\s\S]*?<\/main>/i) || page.match(/<body\b[\s\S]*?<\/body>/i);
+        const text = htmlToText(bodyMatch ? bodyMatch[0] : page).slice(0, 20000);
+        if (text.length > 300) out = { title, company: "", location: "", html: "", text, source: "page-text" };
+      }
+    }
+  } catch { /* fall through */ }
+
+  if (out) {
+    if (jdCache.size > 300) jdCache.delete(jdCache.keys().next().value);
+    jdCache.set(url, out);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Tailored CV → PDF (uses the repo's own template + Playwright pipeline)
 // ---------------------------------------------------------------------------
 const escHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -619,6 +718,60 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  "POST /api/fetch-jd": async (req, res) => {
+    const { url } = await body(req);
+    if (!/^https?:\/\//.test(url || "")) return fail(res, "valid url required");
+    const jd = await fetchJdFromUrl(url);
+    if (!jd) return fail(res, "Couldn't retrieve this posting automatically — it may be JavaScript-rendered. Paste the JD text instead.", 502);
+    ok(res, jd);
+  },
+
+  "GET /api/followups": async (req, res) => {
+    const r = await runNode([join(ROOT, "followup-cadence.mjs")], { timeoutMs: 30_000 });
+    let data = null;
+    try { data = JSON.parse(r.out.slice(r.out.indexOf("{"))); } catch { /* tolerate */ }
+    ok(res, { cadence: data && !data.error ? data : null });
+  },
+
+  "POST /api/gmail-pull": async (req, res) => {
+    const r = await runNode([join(ROOT, "plugins.mjs"), "run", "gmail"], { timeoutMs: 120_000 });
+    ok(res, { code: r.code, output: (r.out + "\n" + r.err).trim().split("\n").slice(-25).join("\n") });
+  },
+
+  "GET /api/plugins": async (req, res) => {
+    const r = await runNode([join(ROOT, "doctor.mjs"), "--json"], { timeoutMs: 30_000 });
+    let plugins = [];
+    try { plugins = JSON.parse(r.out.slice(r.out.indexOf("{"))).plugins || []; } catch { /* absent */ }
+    ok(res, { plugins });
+  },
+
+  // Skill-gap prep plan for an applied job — grounded in the evaluation
+  // report (if one exists), the resume, and the interview answers. Saved to
+  // interview-prep/ (user layer), where the career-ops interview modes read it.
+  "POST /api/prep": async (req, res) => {
+    const { company, role } = await body(req);
+    if (!company || !role) return fail(res, "company and role required");
+    try {
+      const ctx = groundingContext();
+      const slug = slugify(company);
+      const reportFile = existsSync(P.reports)
+        ? readdirSync(P.reports).filter((f) => f.includes(slug) && f.endsWith(".md")).sort().pop()
+        : null;
+      const report = reportFile ? read(join(P.reports, reportFile)) : null;
+      const plan = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are an interview-preparation coach.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nProduce a prep document in markdown with exactly these sections:\n## Skill gaps — requirements this candidate is weakest on for THIS role (from the evaluation report if provided, otherwise inferred from the JD/role vs the resume). Honest, specific.\n## Study plan — for each gap: what to review/practice this week, concrete and scoped.\n## Likely interview questions — 8-10 questions this company/role will probably ask.\n## Your stories — for each of 3-4 questions, which REAL experience from the resume to use (STAR pointers, not invented details).`,
+        },
+        { role: "user", content: `Company: ${company} — Role: ${role}\n${report ? `\nEvaluation report:\n${report.slice(0, 6000)}` : "\n(no evaluation report on file)"}` },
+      ], { maxTokens: 3500 });
+      mkdirSync(join(ROOT, "interview-prep"), { recursive: true });
+      const prepPath = join(ROOT, "interview-prep", `${slug}-${slugify(role)}.md`);
+      writeFileSync(prepPath, `# Prep — ${company} · ${role}\n\n_Generated by Studio ${new Date().toISOString().slice(0, 10)}_\n\n${plan}`);
+      ok(res, { plan, file: `interview-prep/${basename(prepPath)}` });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   // One click: tailor the resume to the JD and render a real ATS-clean PDF
   // through the repo's own template + Playwright pipeline.
   "POST /api/tailored-pdf": async (req, res) => {
@@ -674,7 +827,7 @@ const routes = {
       const raw = await chat(loadSettings(), [
         {
           role: "system",
-          content: `You fill job-application form fields for a candidate.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRules for form filling:\n- For select/radio fields, the value MUST be copied verbatim from the field's options list (pick the one matching the candidate's profile; if none clearly matches, use "").\n- Contact fields come from the profile. Authorization/sponsorship/salary/notice come from the interview block in the profile.\n- Long-answer questions: 60-140 words, grounded in the resume.\n- If the resume/profile doesn't contain the needed fact, return "" for that field. NEVER guess or invent.\n- Output STRICT JSON only: [{"id": "<field id>", "value": "<value>"}]`,
+          content: `You fill job-application form fields for a candidate.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRules per field TYPE — respect the type exactly:\n- select / radio: value MUST be copied VERBATIM from that field's options list. Pick the option matching the candidate's profile; if none clearly matches, "".\n- checkbox: return "Yes" ONLY when the profile clearly affirms the labelled statement; otherwise "". Never "Yes" for consent/certification/terms boxes.\n- text / email / tel / url: the exact value from the profile (email as-is, phone as-is).\n- date: ISO format YYYY-MM-DD, only if derivable from the profile; else "".\n- number: digits only.\n- textarea (long answers): 60-140 words, grounded in the resume, specific.\nGeneral:\n- Contact fields come from the profile. Authorization/sponsorship/salary/notice come from the interview block in the profile.\n- If the resume/profile doesn't contain the needed fact, return "" for that field. NEVER guess or invent.\n- Output STRICT JSON only: [{"id": "<field id>", "value": "<value>"}]`,
         },
         {
           role: "user",

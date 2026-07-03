@@ -410,3 +410,23 @@ main#view {
   font-size: 16px; color: var(--muted); cursor: pointer;
 }
 .overlay-close:hover { background: var(--accent-soft); color: var(--accent-ink); }
+
+/* fetched job posting panel */
+.posting {
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: rgba(255,255,255,.85);
+  padding: 14px 16px;
+  margin-top: 10px;
+}
+.posting-body {
+  max-height: 340px;
+  overflow-y: auto;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+.posting-body h1, .posting-body h2, .posting-body h3, .posting-body h4 { font-family: var(--serif); margin: 14px 0 6px; font-size: 15px; }
+.posting-body ul, .posting-body ol { padding-left: 20px; margin: 6px 0; }
+.posting-body li { margin-bottom: 3px; }
+.posting-body p { margin-bottom: 8px; }
+.posting-body img { max-width: 100%; }
