@@ -356,6 +356,31 @@ function htmlToText(html) {
   ).replace(/[ \t]+/g, " ").replace(/\n\s+/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// Keyless web search via DuckDuckGo's HTML endpoint. Best-effort, cached.
+const searchCache = new Map();
+async function webSearch(query) {
+  const key = query.toLowerCase();
+  if (searchCache.has(key)) return searchCache.get(key);
+  const r = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+    headers: { "user-agent": "Mozilla/5.0 (career-ops-studio)" },
+  });
+  if (!r.ok) throw new Error(`search ${r.status}`);
+  const html = await r.text();
+  const results = [];
+  const re = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/g;
+  let m;
+  while ((m = re.exec(html)) && results.length < 8) {
+    let href = decodeEntities(m[1]);
+    const uddg = href.match(/uddg=([^&]+)/);       // DDG wraps external links
+    if (uddg) href = decodeURIComponent(uddg[1]);
+    if (!/^https?:\/\//.test(href)) continue;
+    results.push({ url: href, title: htmlToText(m[2]).slice(0, 160), snippet: htmlToText(m[3] || "").slice(0, 300) });
+  }
+  if (searchCache.size > 200) searchCache.delete(searchCache.keys().next().value);
+  searchCache.set(key, results);
+  return results;
+}
+
 const jdCache = new Map(); // url → {title, company, location, html, text, source}
 
 async function fetchJdFromUrl(url) {
@@ -718,6 +743,92 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Keyless web search (DuckDuckGo HTML endpoint) — returns title/url/snippet.
+  "GET /api/websearch": async (req, res, url) => {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (q.length < 3) return ok(res, { results: [] });
+    try {
+      ok(res, { results: await webSearch(q) });
+    } catch (e) { fail(res, `Search unavailable (${e.message})`, 502); }
+  },
+
+  // Current skills/trends for a role — searches the web, reads the top
+  // results, and has the model distill what's in demand RIGHT NOW. This is
+  // market intel (not about the user), so web content is fair game here.
+  "POST /api/market-trends": async (req, res) => {
+    const { role, jd } = await body(req);
+    if (!role) return fail(res, "role required");
+    try {
+      const year = new Date().getFullYear();
+      const results = await webSearch(`${role} required skills and hiring trends ${year}`);
+      let corpus = "";
+      for (const r of results.slice(0, 3)) {
+        const page = await fetchJdFromUrl(r.url).catch(() => null);
+        corpus += `\n### ${r.title} (${r.url})\n${(page?.text || r.snippet || "").slice(0, 2500)}\n`;
+      }
+      const cvSkills = (read(P.cv) || "").slice(0, 1500);
+      const summary = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are a job-market analyst. Using the web excerpts provided, summarize what employers want for this role RIGHT NOW. Markdown, these sections:\n## In-demand skills — bullet list, most-cited first; mark each (hard) or (soft).\n## Rising / emerging — tools or topics gaining traction this year.\n## Table stakes — expected baseline.\n## How the candidate stacks up — compare against THIS résumé (below): what they already have vs. gaps worth closing. Be honest; do not invent résumé content.\nCite sources inline like [1],[2] mapping to the excerpts' order. If the web excerpts are thin, say so rather than padding.`,
+        },
+        { role: "user", content: `ROLE: ${role}\n${jd ? `\nJD context:\n${jd.slice(0, 1500)}\n` : ""}\nWEB EXCERPTS:\n${corpus || "(search returned little — rely on general knowledge but flag it)"}\n\nCANDIDATE RÉSUMÉ (excerpt):\n${cvSkills}` },
+      ], { maxTokens: 2200 });
+      ok(res, { summary, sources: results.slice(0, 3).map((r) => ({ title: r.title, url: r.url })) });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // "Ask Job Studio" — global assistant. Knows the user's files and can pull
+  // the web when asked. Read-only advisor; it does not edit files or submit.
+  "POST /api/ask": async (req, res) => {
+    const { messages, pageContext } = await body(req);
+    if (!Array.isArray(messages) || !messages.length) return fail(res, "messages[] required");
+    try {
+      const profile = loadYaml(P.profile) || {};
+      const cv = (read(P.cv) || "").slice(0, 3000);
+      const roles = profile.target_roles?.primary || [];
+      const tracker = parseTracker();
+      const applied = tracker.filter((r) => ["Applied", "Responded", "Interview", "Offer"].includes(r.status));
+
+      // Optional web lookup: if the latest user turn clearly wants current info.
+      const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+      let web = "";
+      if (/\b(latest|current|trend|market|202\d|salary|in demand|right now|news)\b/i.test(lastUser)) {
+        const r = await webSearch(lastUser.slice(0, 120)).catch(() => []);
+        web = r.slice(0, 4).map((x, i) => `[${i + 1}] ${x.title} — ${x.snippet} (${x.url})`).join("\n");
+      }
+
+      const reply = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are "Job Studio" — the user's job-search co-pilot inside a local app. Be concise, concrete, and honest.\n\nWHAT YOU KNOW:\nRÉSUMÉ (excerpt):\n${cv}\n\nTARGET ROLES: ${roles.join(", ") || "not set"}\nINTERVIEW/PROFILE FACTS: ${JSON.stringify(profile.interview || {})}\nAPPLIED (${applied.length}): ${applied.slice(0, 12).map((r) => `${r.role}@${r.company} [${r.status}]`).join("; ") || "none yet"}\n${pageContext ? `\nWHERE THEY ARE: ${pageContext}` : ""}${web ? `\n\nFRESH WEB RESULTS:\n${web}` : ""}\n\nRULES: Advise on their real situation. When you cite the web, reference [n]. Never invent résumé facts. You can't submit applications or edit files — if they want an action (tailor, evaluate, generate PDF), tell them which stage/button does it. Keep answers short unless asked to go deep.`,
+        },
+        ...messages.slice(-12),
+      ], { maxTokens: 1100 });
+      ok(res, { reply });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // Inline résumé-improvement chat (apply screen). The model proposes an
+  // improved résumé for the current JD; when it emits a full markdown résumé
+  // in a ```markdown fence, the UI shows it in the live preview to accept.
+  "POST /api/resume-chat": async (req, res) => {
+    const { messages, jd, company, role } = await body(req);
+    if (!Array.isArray(messages) || !messages.length) return fail(res, "messages[] required");
+    try {
+      const ctx = groundingContext();
+      const reply = await chat(loadSettings(), [
+        {
+          role: "system",
+          content: `You are a résumé editor working on the candidate's résumé for a specific job.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nTHIS JOB — Company: ${company || "?"}, Role: ${role || "?"}\n${jd ? `JD:\n${jd.slice(0, 4000)}\n` : ""}\nHOW YOU WORK:\n- Discuss changes conversationally, but whenever you produce a revised résumé, output the COMPLETE updated résumé as markdown inside a single \`\`\`markdown code fence so the app can preview it. Only reorder/rephrase/emphasise existing facts — never add new claims.\n- Keep the candidate's real employers, dates and metrics intact. Improvements = stronger bullets, JD-aligned wording, better ordering, tighter summary.\n- Outside the fence, briefly say what you changed and why.`,
+        },
+        ...messages.slice(-10),
+      ], { maxTokens: 3000 });
+      const draft = (reply.match(/```(?:markdown|md)?\n([\s\S]*?)```/) || [])[1] || null;
+      ok(res, { reply, draft });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   // Address autocomplete — keyless OSM geocoder (Photon), Nominatim fallback.
   // Returns structured components so pincode/state/country populate themselves.
   "GET /api/geocode": async (req, res, url) => {
@@ -741,6 +852,33 @@ const routes = {
       }).filter((s) => s.label);
       ok(res, { suggestions });
     } catch (e) { fail(res, `Address lookup unavailable (${e.message}) — fill the fields manually.`, 502); }
+  },
+
+  // Place autocomplete for LOCATION fields — cities, regions, countries only
+  // (not street addresses). Powers the choice-based location pickers so a
+  // location is always a selected place, never free text.
+  "GET /api/places": async (req, res, url) => {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (q.length < 2) return ok(res, { places: [] });
+    try {
+      const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=8&lang=en`);
+      if (!r.ok) throw new Error(`geocoder ${r.status}`);
+      const data = await r.json();
+      const seen = new Set();
+      const places = [];
+      for (const f of data.features || []) {
+        const p = f.properties || {};
+        if (!["city", "town", "state", "country", "county", "region", "village", "locality", "district"].includes(p.type)) continue;
+        const name = p.name;
+        const label = [name, p.state && p.state !== name ? p.state : "", p.country && p.country !== name ? p.country : ""].filter(Boolean).join(", ");
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+        places.push({ label, name, state: p.state || "", country: p.country || "", type: p.type });
+      }
+      // Always offer "Remote" for work-preference contexts.
+      if (/^rem/i.test(q)) places.unshift({ label: "Remote", name: "Remote", country: "", type: "remote" });
+      ok(res, { places });
+    } catch (e) { fail(res, `Location lookup unavailable (${e.message})`, 502); }
   },
 
   // Conversational onboarding interview. The model plays recruiter: it knows

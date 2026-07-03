@@ -78,6 +78,51 @@ function md(src) {
 }
 
 const copyText = (t, label = "Copied") => navigator.clipboard.writeText(t).then(() => toast(label));
+
+// Debounced place autocomplete: attaches a suggestion dropdown to an input so
+// locations are ALWAYS chosen from real places, never typed free-form.
+// onPick(place) fires on selection. If chips=true, the input clears after each
+// pick (multi-select); otherwise the label stays in the box (single-select).
+function attachPlaces(input, dropdown, { onPick, chips = false } = {}) {
+  let timer, active = -1, current = [];
+  const close = () => { dropdown.hidden = true; active = -1; };
+  const paint = () => {
+    dropdown.innerHTML = current.length
+      ? current.map((p, i) => `<div class="addr-opt ${i === active ? "hi" : ""}" data-i="${i}">${esc(p.label)}</div>`).join("")
+      : `<div class="addr-opt" style="color:var(--faint)">no matches — keep typing</div>`;
+    dropdown.hidden = false;
+    $$(".addr-opt[data-i]", dropdown).forEach((el) => el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      pick(current[+el.dataset.i]);
+    }));
+  };
+  const pick = (p) => {
+    onPick(p);
+    if (chips) input.value = ""; else input.value = p.label;
+    close();
+  };
+  input.setAttribute("autocomplete", "off");
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) return close();
+    timer = setTimeout(async () => {
+      try {
+        const { places } = await api(`/api/places?q=${encodeURIComponent(q)}`);
+        current = places;
+        paint();
+      } catch { close(); }
+    }, 280);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (dropdown.hidden) return;
+    if (e.key === "ArrowDown") { active = Math.min(active + 1, current.length - 1); paint(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { active = Math.max(active - 1, 0); paint(); e.preventDefault(); }
+    else if (e.key === "Enter" && active >= 0) { pick(current[active]); e.preventDefault(); }
+    else if (e.key === "Escape") close();
+  });
+  input.addEventListener("blur", () => setTimeout(close, 200));
+}
 const markAdds = (t) => esc(t).replace(/\[ADD:([^\]]*)\]/g, "<mark>[ADD:$1]</mark>");
 const spin = `<span class="spinner"></span>`;
 
@@ -394,8 +439,8 @@ stages.resume = async () => {
 const PNTS = "Prefer not to say";
 const IV_FIELDS = [
   { section: "Location & eligibility" },
-  { k: "home_location", label: "Where are you based?", ph: "e.g. Jersey City, NJ", globe: true },
-  { k: "target_locations", label: "Where would you work? (comma-separated cities/countries)", ph: "e.g. New York, Remote, London", globe: true },
+  { k: "home_location", label: "Where are you based?", ph: "Type a city — pick from the list", globe: true, place: true },
+  { k: "target_locations", label: "Where would you work? (pick as many as you like)", ph: "Type a city or “Remote” — pick to add", globe: true, places: true, wide: true },
   { k: "address_search", label: "Street address — start typing, pick a suggestion", ph: "e.g. 554 Washington Blvd…", wide: true, addr: true },
   { k: "address_line1", label: "Address line 1" },
   { k: "address_city", label: "City" },
@@ -434,16 +479,26 @@ stages.interview = async () => {
   const fieldHtml = (f) => {
     if (f.section) return `<div style="grid-column:1/-1;margin-top:10px"><h3 style="font-size:14.5px">${esc(f.section)}</h3></div>`;
     const val = joinVal(state.interview[f.k]);
-    return `
-      <div style="${f.wide ? "grid-column:1/-1;" : ""}${f.addr ? "position:relative;" : ""}">
-        <label class="field">${esc(f.label)}</label>
-        ${f.type === "select"
-          ? `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${val === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
-          : f.area
-            ? `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(val)}</textarea>`
-            : `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(f.addr ? "" : val)}" autocomplete="off">`}
-        ${f.addr ? `<div class="addr-suggest" id="addr-suggest" hidden></div>` : ""}
-      </div>`;
+    const relative = f.addr || f.place || f.places;
+    let control;
+    if (f.type === "select") {
+      control = `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${val === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    } else if (f.places) {
+      control = `<div id="chips-${f.k}" class="loc-chips"></div>
+        <input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" autocomplete="off">
+        <div class="addr-suggest" id="sug-${f.k}" hidden></div>`;
+    } else if (f.place) {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(val)}" autocomplete="off">
+        <div class="addr-suggest" id="sug-${f.k}" hidden></div>`;
+    } else if (f.area) {
+      control = `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(val)}</textarea>`;
+    } else if (f.addr) {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="" autocomplete="off"><div class="addr-suggest" id="addr-suggest" hidden></div>`;
+    } else {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(val)}" autocomplete="off">`;
+    }
+    return `<div style="${f.wide ? "grid-column:1/-1;" : ""}${relative ? "position:relative;" : ""}">
+        <label class="field">${esc(f.label)}</label>${control}</div>`;
   };
 
   view.innerHTML = `
@@ -471,8 +526,19 @@ stages.interview = async () => {
       ${stageNav({ backTo: 2, onNext: true })}
     </div>`;
 
-  const updateGlobe = () => bg().setCities([$("#iv-home_location").value, ...$("#iv-target_locations").value.split(",")].map((x) => x.trim()).filter(Boolean));
-  ["home_location", "target_locations"].forEach((k) => $(`#iv-${k}`).addEventListener("input", updateGlobe));
+  // Target locations = chips, chosen only from real places.
+  let targetLocs = Array.isArray(state.interview.target_locations) ? [...state.interview.target_locations] : [];
+  const updateGlobe = () => bg().setCities([$("#iv-home_location").value, ...targetLocs].map((x) => x.trim()).filter(Boolean));
+  const paintChips = () => {
+    $("#chips-target_locations").innerHTML = targetLocs.map((l, i) => `<span class="chip">${esc(l)} <button data-i="${i}">×</button></span>`).join("");
+    $$("#chips-target_locations [data-i]").forEach((b) => b.addEventListener("click", () => { targetLocs.splice(+b.dataset.i, 1); paintChips(); updateGlobe(); }));
+  };
+  paintChips();
+  attachPlaces($("#iv-home_location"), $("#sug-home_location"), { onPick: (p) => { updateGlobe(); } });
+  attachPlaces($("#iv-target_locations"), $("#sug-target_locations"), {
+    chips: true,
+    onPick: (p) => { if (!targetLocs.includes(p.label)) { targetLocs.push(p.label); paintChips(); updateGlobe(); } },
+  });
   updateGlobe();
 
   // ── Address autocomplete (keyless geocoder via the local server) ──
@@ -509,21 +575,22 @@ stages.interview = async () => {
   const collect = () => {
     const a = {};
     for (const f of IV_FIELDS) {
-      if (f.section || f.addr) continue;
-      const v = $(`#iv-${f.k}`).value.trim();
-      a[f.k] = f.k === "target_locations" ? v.split(",").map((x) => x.trim()).filter(Boolean) : v;
+      if (f.section || f.addr || f.places) continue;
+      a[f.k] = $(`#iv-${f.k}`).value.trim();
     }
+    a.target_locations = targetLocs;
     return a;
   };
   const refreshFromSaved = async () => {
     const { answers: a2 } = await api("/api/interview");
     state.interview = a2 || {};
     for (const f of IV_FIELDS) {
-      if (f.section || f.addr) continue;
+      if (f.section || f.addr || f.places) continue;
       const el = $(`#iv-${f.k}`);
       const v = joinVal(state.interview[f.k]);
       if (v && el.value !== v) el.value = v;
     }
+    if (Array.isArray(state.interview.target_locations)) { targetLocs = [...state.interview.target_locations]; paintChips(); }
     updateGlobe();
   };
 
@@ -661,6 +728,7 @@ function guessCompany(item) {
 }
 let railFilter = "";
 const railState = { loc: "", role: "", tab: "inbox", sort: "default" };
+let currentCvCache = null;
 const wsFor = (id) => (state.ws[id] ||= { jd: "", tab: "evaluate", company: "", role: "", report: null, reportPath: null, score: null, advice: null, answers: null, letter: null });
 
 stages.board = async () => {
@@ -843,7 +911,7 @@ function renderWorkspace() {
       });
   }
 
-  const TABS = [["evaluate", "Evaluate"], ["tailor", "Tailor resume"], ["answers", "Answers"], ["letter", "Cover letter"]];
+  const TABS = [["evaluate", "Evaluate"], ["market", "Market"], ["tailor", "Tailor PDF"], ["improve", "Improve résumé"], ["answers", "Answers"], ["letter", "Cover letter"]];
   wsEl.innerHTML = `
     <div class="card">
       <div class="row">
@@ -922,6 +990,68 @@ function renderWorkspace() {
       } catch (e) { toast(e.message, true); renderWorkspace(); }
     });
     tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.advice));
+  }
+
+  if (w.tab === "market") {
+    tb.innerHTML = w.market
+      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-m">Refresh</button></div>
+         <div class="prose">${md(w.market)}</div>
+         ${w.marketSources?.length ? `<p class="hint" style="margin-top:8px">Sources: ${w.marketSources.map((s, i) => `<a href="${esc(s.url)}" target="_blank">[${i + 1}]</a>`).join(" ")}</p>` : ""}`
+      : `<button class="btn primary" id="run-m">Search the web for current trends</button>
+         <p class="hint" style="margin-top:8px">Live search for what employers want for <b>${esc(w.role || "this role")}</b> right now — in-demand skills, what's rising, and how you stack up.</p>`;
+    (tb.querySelector("#run-m") || tb.querySelector("#re-m"))?.addEventListener("click", async () => {
+      if (!w.role) return toast("Fill in the role title first", true);
+      busy("Searching the web and reading the top results…");
+      try {
+        const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } });
+        w.market = r.summary; w.marketSources = r.sources; renderWorkspace();
+      } catch (e) { toast(e.message, true); renderWorkspace(); }
+    });
+  }
+
+  if (w.tab === "improve") {
+    w.improveMsgs ||= [];
+    w.improveDraft ||= null;
+    tb.innerHTML = `
+      <div class="improve">
+        <div class="improve-preview">
+          <div class="row" style="margin-bottom:6px"><b style="margin-right:auto;font-size:12.5px">Résumé preview</b>
+            ${w.improveDraft ? `<button class="btn small primary" id="imp-accept">Save to cv.md</button>` : ""}</div>
+          <div class="preview-body prose" id="imp-body">${md(w.improveDraft || currentCvCache || "Loading your résumé…")}</div>
+        </div>
+        <div class="improve-chat">
+          <div class="chat-log" id="imp-log">${w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") || `<div class="empty" style="padding:12px">Ask me to sharpen bullets, align to this JD, tighten the summary… I'll show the new version on the left. Same facts, better told.</div>`}</div>
+          <div class="row" style="margin-top:8px">
+            <input type="text" id="imp-in" placeholder="e.g. make the summary punchier and lead with GenAI">
+            <button class="btn primary" id="imp-send">Send</button>
+          </div>
+        </div>
+      </div>`;
+    if (!currentCvCache) api("/api/resume").then((r) => { currentCvCache = r.content; if (!w.improveDraft && w.tab === "improve") $("#imp-body").innerHTML = md(r.content); });
+    const impSend = async () => {
+      const text = $("#imp-in").value.trim();
+      if (!text) return;
+      $("#imp-in").value = "";
+      w.improveMsgs.push({ role: "user", content: text });
+      $("#imp-log").innerHTML = w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
+      $("#imp-log").scrollTop = 1e9;
+      try {
+        const r = await api("/api/resume-chat", { method: "POST", body: { messages: w.improveMsgs, jd: w.jd, company: w.company, role: w.role } });
+        w.improveMsgs.push({ role: "assistant", content: r.reply.replace(/```(?:markdown|md)?\n[\s\S]*?```/, "_(updated résumé shown in the preview →)_") });
+        if (r.draft) w.improveDraft = r.draft;
+        renderWorkspace();
+      } catch (e) { w.improveMsgs.pop(); toast(e.message, true); renderWorkspace(); }
+    };
+    tb.querySelector("#imp-send").addEventListener("click", impSend);
+    tb.querySelector("#imp-in").addEventListener("keydown", (e) => { if (e.key === "Enter") impSend(); });
+    tb.querySelector("#imp-accept")?.addEventListener("click", async () => {
+      if (!confirm("Replace your master résumé (cv.md) with this improved version? Your original is overwritten.")) return;
+      try {
+        await api("/api/resume", { method: "POST", body: { content: w.improveDraft } });
+        currentCvCache = w.improveDraft;
+        toast("Saved to cv.md — all future output uses it");
+      } catch (e) { toast(e.message, true); }
+    });
   }
 
   if (w.tab === "answers") {
@@ -1108,6 +1238,40 @@ $$("[data-overlay]").forEach((b) => b.addEventListener("click", async () => {
 }));
 $("#overlay-close").addEventListener("click", () => ($("#overlay").hidden = true));
 $("#overlay").addEventListener("click", (e) => { if (e.target.id === "overlay") $("#overlay").hidden = true; });
+
+/* ── Ask Job Studio (global assistant) ─────────────────── */
+const askMsgs = [];
+function initAsk() {
+  const fab = $("#ask-fab"), panel = $("#ask-panel"), log = $("#ask-log"), input = $("#ask-in");
+  const paint = (pending) => {
+    log.innerHTML = askMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("")
+      + (pending ? `<div class="msg assistant">${spin}</div>` : "")
+      || `<div class="empty" style="padding:14px">Hi — I know your résumé, your targets, and what you've applied to. Ask me about a role, the job market, or what to do next.</div>`;
+    log.scrollTop = log.scrollHeight;
+  };
+  const toggle = (on) => {
+    panel.hidden = on === undefined ? !panel.hidden : !on;
+    if (!panel.hidden) { paint(false); input.focus(); }
+  };
+  fab.addEventListener("click", () => toggle());
+  $("#ask-close").addEventListener("click", () => toggle(false));
+  const send = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    askMsgs.push({ role: "user", content: text });
+    paint(true);
+    try {
+      const pageContext = `${STAGES[state.stage]?.label || ""} stage${state.activeJob ? "; a job is open in the apply workspace" : ""}`;
+      const r = await api("/api/ask", { method: "POST", body: { messages: askMsgs, pageContext } });
+      askMsgs.push({ role: "assistant", content: r.reply });
+    } catch (e) { askMsgs.push({ role: "assistant", content: `⚠️ ${e.message}` }); }
+    paint(false);
+  };
+  $("#ask-send").addEventListener("click", send);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+}
+initAsk();
 
 /* ── boot: resume the journey where the user left off ──── */
 (async function boot() {

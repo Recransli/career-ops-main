@@ -30,6 +30,20 @@
     </div>
   </div>
 
+  <!-- Ask Job Studio — global assistant, available on every screen -->
+  <button id="ask-fab" title="Ask Job Studio">✦ Ask</button>
+  <div id="ask-panel" hidden>
+    <div class="ask-head">
+      <span><b>Ask Job Studio</b> — your co-pilot</span>
+      <button id="ask-close">×</button>
+    </div>
+    <div id="ask-log" class="chat-log"></div>
+    <div class="ask-input">
+      <input type="text" id="ask-in" placeholder="Ask anything — your search, a role, the market…">
+      <button class="btn primary" id="ask-send">Send</button>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <!-- In-browser file extraction (loaded lazily on demand by app.js):
