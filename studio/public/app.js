@@ -1262,9 +1262,11 @@ function renderPipeSections(job, w) {
       <div class="card">
         <div class="row"><h3 style="margin-right:auto">Tailored résumé</h3>
           <a class="btn small" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download PDF</a>
+          <button class="btn small" data-act="latex">⤓ LaTeX</button>
           <button class="btn small" data-act="re-tailor">Regenerate</button>
           <button class="btn small" data-act="toggle-improve">${w.improveOpen ? "Close improve chat ✕" : "Improve ✎"}</button>
         </div>
+        <div id="tailor-latex-out"></div>
         <p class="hint">Reordered & rephrased for this JD using the fit + market analysis above — same facts, ATS-clean. Saved to <code>output/${esc(w.pdf)}</code>.</p>
         <div class="improve-split ${w.improveOpen ? "open" : ""}">
           <div class="improve-preview">
@@ -1309,6 +1311,15 @@ function wireSections(job, w) {
   on("re-eval", () => { w.report = null; w.step = "evaluating"; w.running = false; runPipeline(job, w); });
   on("re-market", () => reRun(async () => { const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } }); w.market = r.summary; w.marketSources = r.sources; }, "Refreshing market…"));
   on("re-tailor", () => reRun(async () => { const context = [w.report && `FIT:\n${w.report}`, w.market && `MARKET:\n${w.market}`].filter(Boolean).join("\n\n"); const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } }); w.pdf = r.pdf; }, "Regenerating résumé…"));
+  on("latex", async () => {
+    const out = $("#tailor-latex-out");
+    out.innerHTML = `<div class="note">${spin} Building LaTeX + PDF from this tailored résumé…</div>`;
+    try {
+      const draft = w.improveDraft || currentCvCache;
+      const r = await api("/api/resume-docs", { method: "POST", body: { draft } });
+      out.innerHTML = `<div class="note">${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a> ` : ""}${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a>` : ""}${r.latexNote ? `<div class="hint" style="margin-top:6px">${esc(r.latexNote)} <a href="https://overleaf.com" target="_blank">Overleaf →</a></div>` : ""}</div>`;
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+  });
   on("re-letter", () => reRun(async () => { const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; }, "Rewriting letter…"));
   on("toggle-improve", () => { w.improveOpen = !w.improveOpen; renderPipeSections(job, w); });
   on("cl-copy", () => copyText(w.letter));
@@ -1599,14 +1610,32 @@ function agentContext() {
   };
 }
 
-// Render a produced artifact in a canvas overlay with a primary action.
-function showCanvas(title, bodyMd, primary) {
+// Render a produced artifact in a canvas overlay with a primary action and,
+// when it's a résumé, buttons to build downloadable PDF + LaTeX documents.
+function showCanvas(title, bodyMd, primary, opts = {}) {
   $("#overlay").hidden = false;
   $("#overlay-body").innerHTML = `
     <div class="row" style="margin-bottom:10px"><div class="page-title" style="font-size:20px;margin:0;flex:1">${esc(title)}</div>
+      ${opts.resumeDraft !== undefined ? `<button class="btn" id="canvas-docs">⤓ PDF + LaTeX</button>` : ""}
       ${primary ? `<button class="btn primary" id="canvas-primary">${esc(primary.label)}</button>` : ""}</div>
-    <div class="prose" style="max-height:64vh;overflow:auto">${md(bodyMd)}</div>`;
+    <div id="canvas-docs-out"></div>
+    <div class="prose" style="max-height:60vh;overflow:auto">${md(bodyMd)}</div>`;
   if (primary) $("#canvas-primary").addEventListener("click", async () => { await primary.onClick(); });
+  if (opts.resumeDraft !== undefined) {
+    $("#canvas-docs").addEventListener("click", async () => {
+      const btn = $("#canvas-docs"); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Building…`;
+      $("#canvas-docs-out").innerHTML = `<div class="note">Structuring your résumé and rendering documents — a moment on local models…</div>`;
+      try {
+        const r = await api("/api/resume-docs", { method: "POST", body: { draft: opts.resumeDraft || undefined } });
+        $("#canvas-docs-out").innerHTML = `<div class="note">
+          ${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a> ` : ""}
+          ${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a>` : ""}
+          ${r.latexNote ? `<div class="hint" style="margin-top:8px">${esc(r.latexNote)} <a href="https://overleaf.com" target="_blank">Open Overleaf →</a></div>` : ""}
+        </div>`;
+      } catch (e) { $("#canvas-docs-out").innerHTML = ""; toast(e.message, true); }
+      btn.disabled = false; btn.innerHTML = "⤓ PDF + LaTeX";
+    });
+  }
 }
 
 // Execute one agent action. Returns a short status string for the chat.
@@ -1622,15 +1651,15 @@ async function runAgentAction(action) {
     }
     case "regenerateResume": {
       const r = await api("/api/regenerate-resume", { method: "POST", body: { instruction: a.instruction || "improve overall" } });
-      showCanvas("Revised résumé — review before saving", r.draft, {
+      showCanvas("Revised résumé — review, download, or save", r.draft, {
         label: "Save to cv.md",
         onClick: async () => {
           if (!confirm("Replace your master résumé (cv.md) with this version?")) return;
           await api("/api/resume", { method: "POST", body: { content: r.draft } });
           currentCvCache = r.draft; $("#overlay").hidden = true; toast("Saved to cv.md");
         },
-      });
-      return "Drafted a revised résumé — it's open for your review.";
+      }, { resumeDraft: r.draft });
+      return "Drafted a revised résumé — open for review, with PDF + LaTeX download.";
     }
     case "tailorResume": {
       const { w } = needJob();

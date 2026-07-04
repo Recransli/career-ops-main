@@ -1638,6 +1638,91 @@ RULES:
     ok(res, { file: pick.f, b64: readFileSync(join(dir, pick.f)).toString("base64") });
   },
 
+  // Build downloadable résumé documents from the current cv.md (or a passed
+  // draft): a LaTeX .tex (Overleaf-ready) AND a PDF. The PDF is compiled from
+  // LaTeX when tectonic/pdflatex is available, else rendered via the HTML +
+  // Playwright pipeline so there is always a PDF. One structuring call feeds both.
+  "POST /api/resume-docs": async (req, res) => {
+    const { draft } = await body(req);
+    const resumeMd = (draft && draft.trim()) || read(P.cv);
+    if (!resumeMd || resumeMd.length < 40) return fail(res, "No résumé to build — save one first.");
+    const s = loadSettings();
+    if (!s.model) return fail(res, "Connect a model first.");
+    try {
+      const profile = loadYaml(P.profile) || {};
+      const candidate = scrubCandidate(profile.candidate);
+      if (!candidate.full_name) return fail(res, "Missing name in your profile — set Contact details on the Resume step.");
+
+      // Structure the résumé into the shared JSON (faithful — no invention).
+      const raw = await chat(s, [
+        { role: "system", content: `Convert the candidate's résumé into STRICT JSON (no fences):\n{"summary":"","competencies":[],"experience":[{"company":"","role":"","period":"","location":"","bullets":[]}],"projects":[{"title":"","desc":"","tech":""}],"education":[{"title":"degree","org":"school","year":"","location":"","coursework":[]}],"certifications":[{"title":"","org":"","year":""}],"skills":[{"category":"","items":"comma-separated"}]}\nFAITHFUL: only restructure what's in the résumé — never add employers, dates, metrics, or claims. Omit sections with no content (empty arrays).` },
+        { role: "user", content: resumeMd.slice(0, 12000) },
+      ], { maxTokens: 4096 });
+      let data;
+      try { data = JSON.parse((raw.match(/\{[\s\S]*\}/) || ["{}"])[0]); } catch { return fail(res, "The model returned malformed JSON — try again (larger models are more reliable).", 502); }
+
+      const slug = slugify(`${candidate.full_name.split(" ")[0]}-resume`);
+      const date = new Date().toISOString().slice(0, 10);
+      const out = join(ROOT, "output");
+      mkdirSync(out, { recursive: true });
+
+      // 1) Always render an HTML→PDF (Playwright) so a PDF exists.
+      const htmlPath = join(out, `cv-${slug}-${date}.html`);
+      const htmlPdf = `cv-${slug}-${date}.pdf`;
+      writeFileSync(htmlPath, fillCvTemplate(data, candidate));
+      await runNode([join(ROOT, "generate-pdf.mjs"), htmlPath, join(out, htmlPdf), "--format=letter"], { timeoutMs: 120000 }).catch(() => {});
+      const htmlPdfOk = existsSync(join(out, htmlPdf));
+
+      // 2) Build the LaTeX .tex via the repo's builder (Overleaf-ready).
+      const li = (candidate.linkedin || "").replace(/^https?:\/\//, "");
+      const gh = (candidate.github || "").replace(/^https?:\/\//, "");
+      const payload = {
+        name: candidate.full_name,
+        contact_line: [candidate.phone, candidate.email, li, candidate.location].filter(Boolean).join(" | "),
+        email: candidate.email ? { url: `mailto:${candidate.email}`, display: candidate.email } : {},
+        linkedin: li ? { url: `https://${li}`, display: li } : {},
+        github: gh ? { url: `https://${gh}`, display: gh } : {},
+        education: (data.education || []).map((e) => ({ institution: e.org || "", location: e.location || "", degree: e.title || "", dates: e.year || "", coursework: e.coursework || [] })),
+        experience: (data.experience || []).map((j) => ({ company: j.company || "", dates: j.period || "", role: j.role || "", location: j.location || "", bullets: j.bullets || [] })),
+        projects: (data.projects || []).map((p) => ({ name: p.title || "", context: p.tech || "", dates: "", bullets: [p.desc].filter(Boolean) })),
+        skills: (data.skills || []).map((sk) => ({ category: sk.category || "", items: sk.items || "" })),
+      };
+      const jsonPath = join(out, `cv-${slug}-${date}.payload.json`);
+      const texPath = join(out, `cv-${slug}-${date}.tex`);
+      writeFileSync(jsonPath, JSON.stringify(payload));
+      const texRun = await runNode([join(ROOT, "build-cv-latex.mjs"), jsonPath, texPath], { timeoutMs: 30000 });
+      const texOk = existsSync(texPath);
+
+      // 3) Try to compile the .tex → PDF (tectonic/pdflatex). Best-effort.
+      let latexPdf = null, latexNote = "";
+      if (texOk) {
+        const latexPdfPath = join(out, `cv-${slug}-${date}-latex.pdf`);
+        const cr = await runNode([join(ROOT, "generate-latex.mjs"), texPath, latexPdfPath], { timeoutMs: 120000 }).catch(() => ({ code: 1, err: "compile error" }));
+        if (existsSync(latexPdfPath)) latexPdf = basename(latexPdfPath);
+        else latexNote = /tectonic|pdflatex|not found|command/i.test(cr.err || cr.out || "") ? "No LaTeX compiler installed — install tectonic (brew install tectonic) or open the .tex in Overleaf to get the LaTeX PDF." : "LaTeX compile failed; the .tex is still valid for Overleaf.";
+      }
+
+      logEvent("resume_docs", { latex: !!latexPdf });
+      ok(res, {
+        tex: texOk ? basename(texPath) : null,
+        pdf: latexPdf || (htmlPdfOk ? htmlPdf : null),
+        pdfEngine: latexPdf ? "latex" : "html",
+        htmlPdf: htmlPdfOk ? htmlPdf : null,
+        latexNote,
+      });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // Serve a generated résumé file (pdf or tex) for download.
+  "GET /api/file": async (req, res, url) => {
+    const f = basename(url.searchParams.get("f") || "");
+    const p = join(ROOT, "output", f);
+    if (!/\.(pdf|tex)$/.test(f) || !existsSync(p)) return fail(res, "not found", 404);
+    const type = f.endsWith(".pdf") ? "application/pdf" : "application/x-tex";
+    res.writeHead(200, { "content-type": type, "content-disposition": `attachment; filename="${f}"` });
+    res.end(readFileSync(p));
+  },
+
   "GET /api/pdf-file": async (req, res, url) => {
     const f = basename(url.searchParams.get("f") || "");
     const p = join(ROOT, "output", f);
