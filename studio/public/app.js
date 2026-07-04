@@ -708,6 +708,14 @@ stages.scan = async () => {
         <input type="text" id="co-filter" placeholder="Filter ${boards.companies.length} companies — name or tag (ai, fintech, remote…)" style="margin-bottom:8px">
         <div class="board-grid" id="company-list"></div>
         ${boards.otherEnabledCompanies?.length ? `<p class="hint" style="margin-top:8px">Plus ${boards.otherEnabledCompanies.length} companies already in your portals.yml (kept as-is).</p>` : ""}
+        <details style="margin-top:12px"><summary class="hint" style="cursor:pointer">+ Add a company not in the list</summary>
+          <div class="row" style="margin-top:8px">
+            <input type="text" id="add-url" placeholder="Paste a Greenhouse / Lever / Ashby careers URL" style="flex:2;min-width:220px">
+            <input type="text" id="add-name" placeholder="Display name (optional)" style="flex:1;min-width:120px">
+            <button class="btn" id="add-co-btn">Add & include</button>
+          </div>
+          <p class="hint" style="margin-top:6px">e.g. <code>https://job-boards.greenhouse.io/yourcompany</code> — Studio detects the ATS, verifies it responds, and adds it to your scan.</p>
+        </details>
       </div>
 
       <div class="card">
@@ -728,6 +736,20 @@ stages.scan = async () => {
           <button class="btn" id="bg-stop">Stop</button>
         </div>
         <div id="bg-progress" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Daily refresh</h3><span class="hint" id="sched-next"></span></div>
+        <p class="hint">Keep your inventory current — Studio re-scans your boards automatically every day at a set time. (Runs while Studio is open; for always-on, install the Mac agent below.)</p>
+        <div class="row">
+          <label class="hint" style="margin:0"><input type="checkbox" id="sched-on" style="width:auto"> Auto-scan daily at
+            <select id="sched-hour" style="width:auto;padding:4px 8px">${Array.from({ length: 24 }, (_, h) => `<option value="${h}">${String(h).padStart(2, "0")}:00</option>`).join("")}</select></label>
+          <label class="hint" style="margin:0"><input type="checkbox" id="sched-eval" style="width:auto"> then evaluate new jobs</label>
+          <button class="btn" id="sched-save">Save</button>
+          <button class="btn" id="sched-now">Run now</button>
+        </div>
+        <div class="note" style="margin-top:10px"><b>Always-on (macOS):</b> to update daily even when Studio isn't open, run <code>bash studio/mac/install.sh</code> once — it installs a launchd agent that keeps Studio running and lets the daily refresh fire on schedule. Remove with <code>--remove</code>.</div>
+        <div id="sched-out"></div>
       </div>
 
       ${stageNav({ backTo: 4, onNext: true, nextLabel: "To the applications →" })}
@@ -785,6 +807,43 @@ stages.scan = async () => {
     } catch (e) { toast(e.message, true); }
   });
   $("#bg-stop").addEventListener("click", async () => { const { state: st } = await api("/api/background", { method: "POST", body: { action: "stop" } }); renderBg(st); toast("Stopping after the current job…"); });
+
+  // manual add company
+  $("#add-co-btn").addEventListener("click", async () => {
+    const url = $("#add-url").value.trim();
+    if (!url) return toast("Paste a careers URL", true);
+    $("#add-co-btn").disabled = true;
+    try {
+      const r = await api("/api/add-company", { method: "POST", body: { url, name: $("#add-name").value.trim() } });
+      chosen.companies.add(r.name);
+      boards.companies.push({ name: r.name, provider: r.provider, slug: r.slug, tags: ["added"] });
+      boards.companies.sort((a, b) => a.name.localeCompare(b.name));
+      $("#add-url").value = ""; $("#add-name").value = "";
+      renderCompanies();
+      toast(`Added ${r.name} (${r.provider}) — included in your scan`);
+    } catch (e) { toast(e.message, true); }
+    $("#add-co-btn").disabled = false;
+  });
+
+  // daily refresh schedule
+  const renderSched = (sc) => {
+    $("#sched-on").checked = sc.enabled;
+    $("#sched-hour").value = sc.hour;
+    $("#sched-eval").checked = sc.autoEval;
+    $("#sched-next").textContent = sc.enabled && sc.nextRun ? `next: ${new Date(sc.nextRun).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}` : "off";
+    if (sc.lastResult) $("#sched-out").innerHTML = `<p class="hint" style="margin-top:8px">Last run: ${esc(sc.lastResult)}</p>`;
+  };
+  api("/api/schedule").then(({ schedule }) => renderSched(schedule));
+  $("#sched-save").addEventListener("click", async () => {
+    const { schedule } = await api("/api/schedule", { method: "POST", body: { enabled: $("#sched-on").checked, hour: parseInt($("#sched-hour").value), autoEval: $("#sched-eval").checked } });
+    renderSched(schedule);
+    toast(schedule.enabled ? `Daily refresh at ${String(schedule.hour).padStart(2, "0")}:00` : "Daily refresh off");
+  });
+  $("#sched-now").addEventListener("click", async () => {
+    $("#sched-out").innerHTML = `<div class="empty">${spin} Refreshing now…</div>`;
+    try { const r = await api("/api/schedule-run", { method: "POST", body: {} }); $("#sched-out").innerHTML = `<pre class="log">${esc(r.output)}</pre>`; state.status = null; }
+    catch (e) { $("#sched-out").innerHTML = ""; toast(e.message, true); }
+  });
 
   wireNav(4, () => go(6));
 };

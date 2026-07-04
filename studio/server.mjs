@@ -654,6 +654,57 @@ function fillCvTemplate(data, candidate) {
   return html;
 }
 
+// Recognise an ATS + board slug from a careers URL (for manual company add).
+function detectAts(url) {
+  try {
+    const u = new URL(url);
+    const h = u.hostname, seg = u.pathname.split("/").filter(Boolean);
+    if (/greenhouse\.io$/.test(h)) return { provider: "greenhouse", slug: seg[0] };
+    if (u.searchParams.get("gh_jid") || u.searchParams.get("for") || u.searchParams.get("board")) return { provider: "greenhouse", slug: u.searchParams.get("board") || u.searchParams.get("for") || h.split(".").slice(-2, -1)[0] };
+    if (h === "jobs.lever.co") return { provider: "lever", slug: seg[0] };
+    if (h === "jobs.ashbyhq.com") return { provider: "ashby", slug: seg[0] };
+    return null;
+  } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// Daily scheduler — refresh the inventory (scan) every day at a set hour.
+// In-process: works while the server runs. For always-on, install the launchd
+// agent (see studio/mac/). Optionally chains a background evaluation.
+// ---------------------------------------------------------------------------
+const sched = { timer: null, lastRun: 0, lastResult: "" };
+function scheduleConfig() {
+  const s = loadSettings();
+  return { enabled: !!s.scheduleEnabled, hour: Number.isFinite(s.scheduleHour) ? s.scheduleHour : 12, autoEval: !!s.scheduleAutoEval };
+}
+function nextRunAt(hour) {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(hour, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next;
+}
+function armScheduler() {
+  if (sched.timer) { clearTimeout(sched.timer); sched.timer = null; }
+  const cfg = scheduleConfig();
+  if (!cfg.enabled) return;
+  const at = nextRunAt(cfg.hour);
+  sched.timer = setTimeout(async () => {
+    try {
+      const r = await runNode([join(ROOT, "scan.mjs")], { timeoutMs: 15 * 60 * 1000 });
+      sched.lastRun = Date.now();
+      sched.lastResult = (r.out + r.err).trim().split("\n").slice(-3).join(" | ");
+      logEvent("scheduled_scan", { code: r.code });
+      if (cfg.autoEval && !bg.running) runBackground({ threshold: 4, limit: 25 }).catch(() => {});
+    } catch (e) { sched.lastResult = `error: ${e.message}`; }
+    armScheduler(); // reschedule for tomorrow
+  }, at - Date.now());
+}
+function schedulerState() {
+  const cfg = scheduleConfig();
+  return { ...cfg, nextRun: cfg.enabled ? nextRunAt(cfg.hour).toISOString() : null, lastRun: sched.lastRun || null, lastResult: sched.lastResult };
+}
+
 // ---------------------------------------------------------------------------
 // Background evaluation worker (single instance, in-memory state)
 // ---------------------------------------------------------------------------
@@ -851,6 +902,35 @@ const routes = {
       .filter((c) => c.enabled !== false && !known.has((c.name || "").toLowerCase()))
       .map((c) => c.name);
     ok(res, catalog);
+  },
+
+  // Manually add a company by careers URL (we sniff the ATS + slug) or by
+  // provider+slug. Appended to portals.yml tracked_companies with its API URL.
+  "POST /api/add-company": async (req, res) => {
+    if (!yaml) return fail(res, "js-yaml unavailable", 500);
+    const b = await body(req);
+    let { name, provider, slug, url } = b;
+    if (url && (!provider || !slug)) {
+      const d = detectAts(url);
+      if (!d) return fail(res, "Couldn't recognise the ATS from that URL. Use a Greenhouse, Lever, or Ashby careers link — or enter provider + slug directly.");
+      provider = d.provider; slug = d.slug;
+    }
+    if (!provider || !slug) return fail(res, "Need a careers URL, or provider + slug.");
+    name = (name || slug).trim();
+    const api = { greenhouse: `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs`, lever: `https://api.lever.co/v0/postings/${slug}`, ashby: `https://api.ashbyhq.com/posting-api/job-board/${slug}` }[provider];
+    if (!api) return fail(res, "provider must be greenhouse, lever, or ashby");
+    // Verify it resolves before saving (cheap, avoids dead entries).
+    const probe = await fetch(api).catch(() => null);
+    if (!probe?.ok) return fail(res, `That board didn't respond (${probe?.status || "no response"}). Check the slug.`, 502);
+    ensurePortals();
+    const portals = loadYaml(P.portals) || {};
+    portals.tracked_companies = portals.tracked_companies || [];
+    const exists = portals.tracked_companies.find((c) => (c.name || "").toLowerCase() === name.toLowerCase());
+    if (exists) { exists.enabled = true; exists.api = api; exists.provider = provider; }
+    else portals.tracked_companies.push({ name, careers_url: url || `https://jobs.${provider}.co/${slug}`, provider, api, enabled: true });
+    writeFileSync(P.portals, yaml.dump(portals, { lineWidth: 120 }));
+    logEvent("add_company", { provider });
+    ok(res, { saved: true, name, provider, slug });
   },
 
   "POST /api/boards": async (req, res) => {
@@ -1477,6 +1557,22 @@ RULES:
   // Background evaluation queue. Evaluates pending inbox postings one at a
   // time (local models are serial anyway); for score ≥ threshold it auto-runs
   // the full prep pipeline (tailor PDF + cover letter). Poll /api/background.
+  "GET /api/schedule": async (req, res) => ok(res, { schedule: schedulerState() }),
+  "POST /api/schedule": async (req, res) => {
+    const b = await body(req);
+    const cur = loadSettings();
+    saveSettings({ ...cur, scheduleEnabled: !!b.enabled, scheduleHour: Number.isFinite(b.hour) ? b.hour : 12, scheduleAutoEval: !!b.autoEval });
+    armScheduler();
+    ok(res, { schedule: schedulerState() });
+  },
+  // Run the daily refresh immediately (manual trigger of the scheduled job).
+  "POST /api/schedule-run": async (req, res) => {
+    const r = await runNode([join(ROOT, "scan.mjs")], { timeoutMs: 15 * 60 * 1000 });
+    sched.lastRun = Date.now();
+    sched.lastResult = (r.out + r.err).trim().split("\n").slice(-3).join(" | ");
+    ok(res, { schedule: schedulerState(), output: (r.out + r.err).trim().split("\n").slice(-30).join("\n") });
+  },
+
   "POST /api/background": async (req, res) => {
     const { action, threshold = 4, limit = 20 } = await body(req);
     if (action === "stop") { bg.stop = true; return ok(res, { state: bgState() }); }
@@ -1613,4 +1709,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`\n  Career-Ops Studio\n  → http://localhost:${PORT}\n  career-ops root: ${ROOT}\n`);
+  armScheduler();
+  const sc = schedulerState();
+  if (sc.enabled) console.log(`  daily refresh: ${sc.hour}:00 (next ${sc.nextRun})\n`);
 });

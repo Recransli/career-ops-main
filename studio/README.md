@@ -13,6 +13,8 @@ The whole thing is a **journey**, not a portal: Start → Model → Resume → a
 - **The onboarding interview** — answer everything applications ask, exactly once: authorization, sponsorship, salary, notice, relocation, clearance, your story, and *optional* self-identification (gender, race/ethnicity, veteran, disability — used only to pre-fill the EEO sections you'd fill anyway; "Prefer not to say" is always an answer). Do it as a form, or **talk it through in chat**: the companion reads real postings for your target role from your own scan and asks what those applications will actually want. Your **street address autocompletes** (keyless OSM geocoder) and fills city/state/ZIP/country as validated components.
 - **1,300+ searchable job roles** across 16 fields — pick your targets and the portal scanner's keywords and your profile are configured automatically.
 - **Pick your boards & companies** — the Discover step is a picker: 13 remote/aggregator boards (RemoteOK, We Work Remotely, Remotive, Himalayas, Arbeitnow, HN Who's Hiring…) and 75+ direct-company career sites (Anthropic, Stripe, Figma, Databricks, Notion…), filterable by name or tag. Your selection is written into `portals.yml` with the right ATS API for each. Precise phrase-level keywords (from your target roles) cut the false positives that bare words like "Engineer" caused.
+- **Add any company yourself** — paste a Greenhouse/Lever/Ashby careers URL; Studio detects the ATS, verifies the board responds, and adds it to your scan.
+- **Daily refresh** — turn on an automatic daily re-scan at a time you choose (default 12:00), optionally chaining a background evaluation of new jobs. Runs while Studio is open; for always-on (updates even when Studio is closed), one command installs a macOS launchd agent — see below.
 - **Background evaluation** — kick off evaluation of your inbox in the background; for strong matches (≥ your threshold, default 4/5) Studio auto-prepares the tailored PDF and cover letter, so high-fit jobs are ready when you sit down. Start/stop with live progress.
 - **Zero-token job scanning** — hits Greenhouse/Lever/Ashby and 40+ other job-board APIs directly through career-ops' scanner. No AI cost to find openings.
 - **A job board that does the reading for you** — thousands of scanned postings with status tabs (Inbox / Evaluated / Applied), location and role filters, search and sorting. Pick a job and **the full posting loads by itself** from the Greenhouse/Lever/Ashby public APIs (page-text fallback for everything else) — no copy-pasting JDs. The workspace then offers four moves: **Evaluate** (full A–G report, fit score /5), **Tailor resume**, **Answers**, **Cover letter**. *"I applied"* asks for a quick note while it's fresh, tracks the job through career-ops' pipeline, and moves you on.
@@ -68,6 +70,15 @@ ollama pull qwen2.5-coder:32b   # good default if you have ~24GB (V)RAM
 ```
 
 > **Model size matters.** Per the career-ops docs, 7–8B models are too weak for the structured evaluation format — they miss the schema and, worse, *embellish*. Use **32B+** for evaluations you'll trust. Smaller models are OK for cover-letter first drafts you'll edit heavily. A cheap hosted option (DeepSeek, OpenRouter Llama 3.3 70B) costs cents and beats a small local model.
+
+### Run it like a Mac app (optional)
+
+No Electron, no build — Studio stays a plain local server. On macOS you get two native conveniences:
+
+- **Double-click launcher:** open `studio/mac/launch.command` — it starts the server if needed and opens Studio in your browser. (First run: right-click → Open to clear Gatekeeper.)
+- **Always-on + daily refresh:** run `bash studio/mac/install.sh` once. It installs a launchd LaunchAgent so Studio starts at login, restarts if it crashes, and the daily refresh (set in Discover → Daily refresh) fires on schedule even when you haven't opened the app. Uninstall with `bash studio/mac/install.sh --remove`.
+
+Why not a full Mac app? An Electron/Tauri build would add ~150 MB and a build step, breaking the zero-dependency, cross-platform, publish-to-GitHub design. `launchd` is the macOS-native way to get "always running + scheduled" without any of that.
 
 Pointing Studio at a career-ops checkout somewhere else:
 
