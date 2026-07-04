@@ -6,7 +6,7 @@ Studio is a *wrapper*, not a fork: it drives the career-ops scripts you already 
 
 ## What you get
 
-The whole thing is a **journey**, not a portal: Start → Model → Resume → a short interview about you → Roles → Discover → Apply → Track. A WebGL scene (three.js) travels forward with you — and finds your cities on a globe when you tell it where you'd work.
+**Setup once, then it's a cockpit.** The first run is a guided journey (Model → Resume → a short interview → Roles → Discover); after that Studio opens to a **Cockpit** — a ranked queue of already-prepared, high-fit jobs waiting for a yes/no. A WebGL scene (three.js) sits behind it all. An **action-capable assistant** on every screen both advises *and* does: tell it "regenerate my résumé to lead with GenAI" or "add Stripe's careers board" and it acts, rendering the result in the window. Automation (daily scan + background prep of strong matches) runs so the work is done before you sit down.
 
 - **Bring your own model** — local Ollama (free, private, offline) or any OpenAI-compatible API: OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, LM Studio, vLLM, llama.cpp. Pick the provider, fetch the model list, select, done. Keys live only in `studio/.local/` on your machine (gitignored).
 - **Any-format resume** — PDF, DOCX, PNG/JPG (via your vision model), LaTeX, Markdown, or plain text. PDFs and DOCX are extracted *in your browser* (pdf.js / mammoth); everything is faithfully transcribed to markdown by your model, and **you review the conversion before it's saved** as `cv.md`, the single source of truth.
@@ -52,16 +52,14 @@ A local test harness (`http://localhost:4949/test-form.html`) runs the exact shi
 ## Quick start
 
 ```bash
-# 1. Get career-ops and install its deps (Node 18+)
 git clone https://github.com/santifer/career-ops
-cd career-ops && npm install
-
-# 2. Drop the studio/ folder into the checkout (if it isn't already there)
-
-# 3. Run
-node studio/server.mjs
-# → http://localhost:4949
+cd career-ops
+node studio/setup.mjs      # checks Node, installs deps, finds a model, launches + opens
 ```
+
+`setup.mjs` is the front door: it runs a preflight doctor (Node 18+, dependencies, a reachable model, a free port), fixes what it can, then starts Studio and opens `http://localhost:4949`. Run `node studio/setup.mjs --check` to just see the report. If you'd rather start it plainly: `node studio/server.mjs`.
+
+The first time, Studio walks you through a short **Setup journey** (model → résumé → a quick interview → target roles → boards). After that it opens straight to your **Cockpit** — a decision queue of already-prepared, high-fit jobs — and Setup collapses into the ⚙ menu.
 
 Using a local model? Install [Ollama](https://ollama.com) and pull something with enough headroom:
 
@@ -106,14 +104,28 @@ Studio inherits career-ops' ethics rules and enforces them:
 
 ```
 studio/
+├── setup.mjs            # first-run doctor + launcher (node studio/setup.mjs)
 ├── server.mjs           # zero-dependency Node server (stdlib http only)
 ├── public/              # vanilla HTML/CSS/JS — no framework, no build step
-├── data/roles.json      # generated role catalog + question banks
-├── scripts/build-roles.mjs  # regenerate the catalog (npm run build:roles)
-└── .local/              # your settings & keys (gitignored)
+├── extension/           # Chrome/Edge form-filler (load unpacked)
+├── mac/                 # double-click launcher + launchd always-on install
+├── data/                # generated catalogs (roles, boards) + build scripts
+├── scripts/smoke.mjs    # endpoint smoke tests (npm test)
+└── .local/              # your settings, keys, per-job artifacts (gitignored)
 ```
 
 The server only ever writes career-ops **user-layer** files (`cv.md`, `config/profile.yml`, `portals.yml`) and delegates evaluation/scanning to career-ops' own scripts — so everything Studio produces is also visible to the career-ops CLI, and vice versa.
+
+Run the tests: `npm test` (boots the server on a scratch dir and checks the endpoints — no model needed).
+
+## Sharing it with others
+
+Studio is **local-first** — a person's résumé and keys never leave their machine — which makes it safe to hand around:
+
+- **One command:** `node studio/setup.mjs` does the doctor + install + launch. That's the whole onboarding.
+- **The extension** installs unpacked today (`chrome://extensions` → Developer mode → Load unpacked → `studio/extension/`); a Chrome Web Store listing is the next step for one-click install.
+- **Docker:** career-ops ships a `Dockerfile`; run the server in a container and browse to it locally if you'd rather not put Node on the host.
+- **No account, no cloud, no telemetry leaves the box** — usage counts stay in `studio/.local/telemetry.jsonl` for your own tuning.
 
 ## Credits
 

@@ -92,6 +92,21 @@ try {
   const addBad = await post("/api/add-company", { url: "https://example.com" });
   check("POST /api/add-company rejects non-ATS", addBad.status >= 400);
 
+  const cockpit = await get("/api/cockpit");
+  check("GET /api/cockpit shape", cockpit.json?.counts && Array.isArray(cockpit.json?.review));
+
+  const digest = await post("/api/digest", {});
+  check("POST /api/digest (model-free)", typeof digest.json?.digest === "string" && digest.json.digest.includes("digest"));
+
+  const agentGuard = await post("/api/agent", {});
+  check("POST /api/agent guards empty", agentGuard.status >= 400);
+
+  const regenGuard = await post("/api/regenerate-resume", {});
+  check("POST /api/regenerate-resume guards", regenGuard.status >= 400);
+
+  const inferGuard = await post("/api/infer-status", { text: "" });
+  check("POST /api/infer-status guards", inferGuard.status >= 400);
+
   const notFound = await get("/api/does-not-exist");
   check("unknown api → 404", notFound.status === 404);
 
