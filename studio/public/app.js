@@ -145,24 +145,38 @@ const STAGES = [
   { id: "scan", label: "Discover" },
   { id: "board", label: "Apply" },
   { id: "track", label: "Track" },
+  { id: "cockpit", label: "Home" },
 ];
+const IDX = Object.fromEntries(STAGES.map((s, i) => [s.id, i]));
+const SETUP_STAGES = [1, 2, 3, 4, 5]; // model→discover
+const setupComplete = () => state.setup?.model && state.setup?.cv && state.setup?.roles;
 
 function renderRail() {
-  $("#journey-rail").innerHTML = STAGES.map((s, i) => `
-    <div class="j-step ${i < state.stage ? "done" : ""} ${i === state.stage ? "active" : ""}">
-      <span class="j-dot" data-stage="${i}" title="${s.label}">${i < state.stage ? "✓" : i + 1}<span class="j-label">${s.label}</span></span>
-      ${i < STAGES.length - 1 ? `<span class="j-line"></span>` : ""}
-    </div>`).join("");
+  const rail = $("#journey-rail");
+  // Post-setup: a compact cockpit nav. During onboarding: the journey dots.
+  if (setupComplete() && !SETUP_STAGES.includes(state.stage) && state.stage !== IDX.welcome) {
+    const nav = [["cockpit", "Home"], ["board", "Apply"], ["track", "Track"]];
+    rail.innerHTML = `<div class="cockpit-nav">
+      ${nav.map(([id, l]) => `<button class="cnav ${state.stage === IDX[id] ? "active" : ""}" data-stage="${IDX[id]}">${l}</button>`).join("")}
+      <button class="cnav gear" data-stage="${IDX.model}" title="Setup & settings">⚙</button>
+    </div>`;
+  } else {
+    rail.innerHTML = STAGES.slice(0, 8).map((s, i) => `
+      <div class="j-step ${i < state.stage ? "done" : ""} ${i === state.stage ? "active" : ""}">
+        <span class="j-dot" data-stage="${i}" title="${s.label}">${i < state.stage ? "✓" : i + 1}<span class="j-label">${s.label}</span></span>
+        ${i < 7 ? `<span class="j-line"></span>` : ""}
+      </div>`).join("");
+  }
   $$("#journey-rail [data-stage]").forEach((d) => d.addEventListener("click", () => {
     const i = +d.dataset.stage;
-    if (i <= state.maxStage) go(i);
+    if (setupComplete() || i <= state.maxStage) go(i);
   }));
 }
 
 async function go(i) {
   state.stage = i;
   state.maxStage = Math.max(state.maxStage, i);
-  bg().setStage(i);
+  bg().setStage(Math.min(i, 7));
   bg().setGlobe(STAGES[i].id === "interview");
   renderRail();
   view.innerHTML = `<div class="empty">${spin}</div>`;
@@ -848,6 +862,69 @@ stages.scan = async () => {
   wireNav(4, () => go(6));
 };
 
+/* 8 — Cockpit: the post-setup home. A decision queue, not a portal. */
+stages.cockpit = async () => {
+  const c = await api("/api/cockpit");
+  const bgOn = c.background?.running;
+  const sched = c.schedule;
+  const greeting = new Date().getHours() < 12 ? "Good morning" : new Date().getHours() < 18 ? "Good afternoon" : "Good evening";
+  const name = (state.profileName || "").split(" ")[0] || "";
+  view.innerHTML = `
+    <div class="stage">
+      <div class="page-title">${greeting}${name ? `, ${esc(name)}` : ""}.</div>
+      <p class="page-sub">${c.counts.reviewPrepared ? `${c.counts.reviewPrepared} high-fit application${c.counts.reviewPrepared === 1 ? "" : "s"} prepared and waiting for your call.` : "Your cockpit — everything that needs a decision, in one place."}</p>
+
+      <div class="cockpit-status card">
+        <div class="row">
+          <span class="hint" style="margin:0;flex:1">
+            ${bgOn ? `<span class="spinner"></span> Preparing applications in the background (${c.background.done}/${c.background.total})` :
+              sched.enabled ? `✓ Auto-refresh daily at ${String(sched.hour).padStart(2, "0")}:00 · ${c.counts.review} evaluated in queue` :
+              `Automation off — turn on daily refresh in Discover to keep this current`}
+          </span>
+          <button class="btn small" data-go-idx="${IDX.scan}">Discover</button>
+          ${!bgOn ? `<button class="btn small primary" id="ck-prep">Prepare inbox</button>` : `<button class="btn small" id="ck-stop">Stop</button>`}
+        </div>
+      </div>
+
+      <div class="cockpit-grid">
+        <div>
+          <div class="ck-head">To review · ${c.counts.review}${c.counts.reviewPrepared ? ` · ${c.counts.reviewPrepared} ready` : ""}</div>
+          ${c.review.length ? c.review.slice(0, 12).map((j) => `
+            <div class="ck-card" data-open-url="${esc(j.url || "")}" data-open-co="${esc(j.company || "")}" data-open-role="${esc(j.role || "")}">
+              <div class="row"><div style="flex:1;min-width:0">
+                <div class="ck-title">${esc(j.role || "role")}</div>
+                <div class="hint" style="margin:0">${esc(j.company || "")}</div>
+              </div>
+              <span class="score-badge ${j.score >= 4 ? "hi" : "lo"}" style="font-size:16px;padding:3px 10px">${j.score}/5</span></div>
+              <div class="row" style="margin-top:8px">
+                ${j.prepared ? `<span class="pill ok">prepared</span>` : `<span class="pill off">evaluated</span>`}
+                <button class="btn small primary" style="margin-left:auto">Open →</button>
+              </div>
+            </div>`).join("") : `<div class="card"><div class="empty">Nothing to review yet — scan and evaluate to fill your queue.</div></div>`}
+        </div>
+        <div>
+          <div class="ck-head">Follow-ups${c.counts.followUpsDue ? ` · ${c.counts.followUpsDue} due` : ""}</div>
+          ${c.applied.length ? c.applied.slice(0, 6).map((a) => `
+            <div class="ck-mini"><div style="flex:1;min-width:0"><b>${esc(a.company)}</b><br><span class="hint">${esc(a.role)}</span></div>
+            <span class="pill ${a.followUpDue ? "warn" : "off"}">${a.daysSince}d</span></div>`).join("") : `<p class="hint">No applications yet.</p>`}
+          <div class="ck-head" style="margin-top:16px">Interviewing · ${c.counts.interviewing}</div>
+          ${c.interviewing.length ? c.interviewing.map((i) => `
+            <div class="ck-mini"><div style="flex:1;min-width:0"><b>${esc(i.company)}</b><br><span class="hint">${esc(i.role)}${i.daysToInterview != null ? ` · in ${i.daysToInterview}d` : ""}</span></div>
+            <button class="btn small" data-go-idx="${IDX.track}">Prep</button></div>`).join("") : `<p class="hint">No interviews scheduled.</p>`}
+          <button class="btn" data-go-idx="${IDX.track}" style="width:100%;justify-content:center;margin-top:12px">Open Track →</button>
+        </div>
+      </div>
+    </div>`;
+
+  $$("[data-go-idx]").forEach((b) => b.addEventListener("click", () => go(+b.dataset.goIdx)));
+  $$(".ck-card").forEach((el) => el.addEventListener("click", () => {
+    state.pendingOpen = { url: el.dataset.openUrl || null, company: el.dataset.openCo, role: el.dataset.openRole };
+    go(IDX.board);
+  }));
+  $("#ck-prep")?.addEventListener("click", async () => { await api("/api/background", { method: "POST", body: { action: "start", threshold: 4, limit: 20 } }); toast("Preparing your inbox…"); stages.cockpit(); });
+  $("#ck-stop")?.addEventListener("click", async () => { await api("/api/background", { method: "POST", body: { action: "stop" } }); toast("Stopping…"); stages.cockpit(); });
+};
+
 /* 6 — Apply board (LinkedIn-style rail + workspace) */
 async function loadJobs() {
   const [{ items }, { rows }] = await Promise.all([api("/api/pipeline"), api("/api/tracker")]);
@@ -870,6 +947,14 @@ const wsFor = (id) => (state.ws[id] ||= { jd: "", tab: "evaluate", company: "", 
 
 stages.board = async () => {
   await Promise.all([loadJobs(), loadCatalog()]);
+  // Came from the cockpit with a specific job to open?
+  if (state.pendingOpen) {
+    const p = state.pendingOpen; state.pendingOpen = null;
+    let job = p.url && state.jobs.find((j) => j.url === p.url);
+    if (!job) job = state.jobs.find((j) => (j.company || "").toLowerCase() === (p.company || "").toLowerCase() && (j.role || j.title || "").toLowerCase().includes((p.role || "").toLowerCase()));
+    if (!job && (p.company || p.role)) { job = { id: `m-${Date.now()}`, title: `${p.role} — ${p.company}`, url: p.url, company: p.company, role: p.role, status: "Inbox" }; state.jobs.unshift(job); }
+    if (job) { state.activeJob = job.id; railState.tab = "all"; }
+  }
   view.innerHTML = `
     <div class="stage">
       <div class="row">
@@ -1569,12 +1654,20 @@ initHealth();
 (async function boot() {
   try {
     const s = await loadStatus();
+    const prof = await api("/api/profile").catch(() => ({}));
+    state.profileName = prof.candidate?.full_name || "";
+    state.setup = { model: !!s.settings.model, cv: s.cv, roles: !!(s.portals && s.profile) };
+    // Setup complete → land in the cockpit. Otherwise resume the journey.
+    if (setupComplete()) {
+      state.maxStage = IDX.cockpit;
+      renderRail();
+      return go(IDX.cockpit);
+    }
     const iv = await api("/api/interview").then((r) => r.answers || {}).catch(() => ({}));
-    const done = [true, !!s.settings.model, s.cv, Object.keys(iv).some((k) => iv[k]?.length), s.portals && s.profile, s.pipeline > 0 || s.reports > 0];
+    const done = [true, state.setup.model, s.cv, Object.keys(iv).some((k) => iv[k]?.length), state.setup.roles, s.pipeline > 0 || s.reports > 0];
     let first = done.findIndex((d) => !d);
-    const allDone = first === -1;
-    if (allDone) first = 6;
-    state.maxStage = allDone ? 7 : Math.max(first, 0);
+    if (first === -1) first = IDX.board;
+    state.maxStage = Math.max(first, 0);
     renderRail();
     go(first <= 1 && !s.cv ? 0 : first);
   } catch (e) {
