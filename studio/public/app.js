@@ -1317,7 +1317,7 @@ function wireSections(job, w) {
     try {
       const draft = w.improveDraft || currentCvCache;
       const r = await api("/api/resume-docs", { method: "POST", body: { draft } });
-      out.innerHTML = `<div class="note">${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a> ` : ""}${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a>` : ""}${r.latexNote ? `<div class="hint" style="margin-top:6px">${esc(r.latexNote)} <a href="https://overleaf.com" target="_blank">Overleaf →</a></div>` : ""}</div>`;
+      renderDocsLinks(out, r, draft);
     } catch (e) { out.innerHTML = ""; toast(e.message, true); }
   });
   on("re-letter", () => reRun(async () => { const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; }, "Rewriting letter…"));
@@ -1610,6 +1610,38 @@ function agentContext() {
   };
 }
 
+// Render résumé document links (PDF + LaTeX). When no LaTeX engine is present,
+// offers a one-click install (tectonic) and polls until ready, then rebuilds.
+function renderDocsLinks(host, r, draft) {
+  host.innerHTML = `<div class="note">
+    ${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a> ` : ""}
+    ${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a>` : ""}
+    ${r.latexNote ? `<div class="hint" style="margin-top:8px">${esc(r.latexNote)}
+      ${r.canInstall ? `<button class="btn small" id="install-latex">Install LaTeX engine (one-click)</button> or ` : " "}<a href="https://overleaf.com" target="_blank">Open Overleaf →</a></div>` : ""}
+    <div id="install-out"></div></div>`;
+  host.querySelector("#install-latex")?.addEventListener("click", async () => {
+    const out = host.querySelector("#install-out");
+    out.innerHTML = `<div class="hint" style="margin-top:8px">${spin} Installing tectonic — first time downloads ~30MB, a few minutes…</div>`;
+    try {
+      await api("/api/install-latex", { method: "POST", body: {} });
+      const poll = setInterval(async () => {
+        const { state } = await api("/api/latex-status");
+        if (state.log?.length) out.querySelector(".log-line") ? null : null;
+        if (!state.running) {
+          clearInterval(poll);
+          if (state.engine) {
+            out.innerHTML = `<div class="hint" style="margin-top:8px">✓ LaTeX engine ready — rebuilding your PDF…</div>`;
+            const r2 = await api("/api/resume-docs", { method: "POST", body: { draft: draft || undefined } });
+            renderDocsLinks(host, r2, draft);
+          } else {
+            out.innerHTML = `<div class="hint" style="margin-top:8px">Install didn't complete (${esc(state.error || "unknown")}). Try <code>brew install tectonic</code>, or use Overleaf.</div>`;
+          }
+        }
+      }, 4000);
+    } catch (e) { out.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+  });
+}
+
 // Render a produced artifact in a canvas overlay with a primary action and,
 // when it's a résumé, buttons to build downloadable PDF + LaTeX documents.
 function showCanvas(title, bodyMd, primary, opts = {}) {
@@ -1627,11 +1659,7 @@ function showCanvas(title, bodyMd, primary, opts = {}) {
       $("#canvas-docs-out").innerHTML = `<div class="note">Structuring your résumé and rendering documents — a moment on local models…</div>`;
       try {
         const r = await api("/api/resume-docs", { method: "POST", body: { draft: opts.resumeDraft || undefined } });
-        $("#canvas-docs-out").innerHTML = `<div class="note">
-          ${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a> ` : ""}
-          ${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a>` : ""}
-          ${r.latexNote ? `<div class="hint" style="margin-top:8px">${esc(r.latexNote)} <a href="https://overleaf.com" target="_blank">Open Overleaf →</a></div>` : ""}
-        </div>`;
+        renderDocsLinks($("#canvas-docs-out"), r, opts.resumeDraft);
       } catch (e) { $("#canvas-docs-out").innerHTML = ""; toast(e.message, true); }
       btn.disabled = false; btn.innerHTML = "⤓ PDF + LaTeX";
     });

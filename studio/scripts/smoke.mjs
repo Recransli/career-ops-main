@@ -107,6 +107,12 @@ try {
   const inferGuard = await post("/api/infer-status", { text: "" });
   check("POST /api/infer-status guards", inferGuard.status >= 400);
 
+  const latex = await get("/api/latex-status");
+  check("GET /api/latex-status", latex.json?.state && "engine" in latex.json.state);
+
+  const fileGuard = await get("/api/file?f=../server.mjs");
+  check("GET /api/file blocks traversal", fileGuard.status === 404);
+
   const notFound = await get("/api/does-not-exist");
   check("unknown api → 404", notFound.status === 404);
 

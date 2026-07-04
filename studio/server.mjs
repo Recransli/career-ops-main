@@ -15,10 +15,10 @@
  */
 
 import http from "http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync, appendFileSync, unlinkSync } from "fs";
+import { spawn, execFileSync } from "child_process";
 import { join, dirname, extname, resolve, basename } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
-import { spawn } from "child_process";
 
 const STUDIO = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(process.env.CAREER_OPS_ROOT || join(STUDIO, ".."));
@@ -260,9 +260,11 @@ function ensureTracker() {
   }
 }
 
-function runNode(args, { timeoutMs = 15 * 60 * 1000 } = {}) {
+function runNode(args, { timeoutMs = 15 * 60 * 1000, extraPath = "" } = {}) {
   return new Promise((resolvePromise) => {
-    const child = spawn(process.execPath, args, { cwd: ROOT, env: { ...process.env } });
+    const env = { ...process.env };
+    if (extraPath) env.PATH = `${extraPath}:${env.PATH || ""}`;
+    const child = spawn(process.execPath, args, { cwd: ROOT, env });
     let out = "", err = "";
     const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
     child.stdout.on("data", (d) => (out += d));
@@ -272,6 +274,90 @@ function runNode(args, { timeoutMs = 15 * 60 * 1000 } = {}) {
       resolvePromise({ code, out, err });
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// LaTeX engine — detect / install tectonic so LaTeX PDFs compile locally
+// without the user touching a terminal.
+// ---------------------------------------------------------------------------
+const LOCAL_BIN = join(LOCAL, "bin");
+function which(cmd) {
+  try { return execFileSync(process.platform === "win32" ? "where" : "which", [cmd], { encoding: "utf8" }).trim().split("\n")[0] || null; }
+  catch { return null; }
+}
+function latexEngine() {
+  const localTec = join(LOCAL_BIN, process.platform === "win32" ? "tectonic.exe" : "tectonic");
+  if (existsSync(localTec)) return { engine: "tectonic", path: localTec, source: "studio" };
+  const tec = which("tectonic"); if (tec) return { engine: "tectonic", path: tec, source: "system" };
+  const pdf = which("pdflatex"); if (pdf) return { engine: "pdflatex", path: pdf, source: "system" };
+  return { engine: null };
+}
+
+// Compile a .tex to PDF directly with the detected engine. Bypasses the repo's
+// generate-latex.mjs validator (which requires 4 fixed sections) so résumés
+// without, say, a projects section still compile. Returns the pdf path or null.
+function compileLatex(texPath, outDir) {
+  const eng = latexEngine();
+  if (!eng.engine) return null;
+  const pdf = join(outDir, basename(texPath).replace(/\.tex$/, ".pdf"));
+  const env = { ...process.env, PATH: `${LOCAL_BIN}:${process.env.PATH || ""}` };
+  try {
+    if (eng.engine === "tectonic") {
+      execFileSync(eng.path, ["--outdir", outDir, "--chatter", "minimal", texPath], { stdio: "ignore", timeout: 120000, env });
+    } else {
+      for (let i = 0; i < 2; i++) execFileSync(eng.path, ["-interaction=nonstopmode", "-halt-on-error", "-output-directory", outDir, texPath], { stdio: "ignore", timeout: 120000, env });
+    }
+  } catch { /* tectonic may still emit a usable pdf on warnings */ }
+  return existsSync(pdf) ? pdf : null;
+}
+
+const tec = { running: false, done: false, error: "", log: [] };
+const tecState = () => ({ running: tec.running, done: tec.done, error: tec.error, log: tec.log.slice(-12), ...latexEngine() });
+
+function spawnStream(cmd, args, opts = {}) {
+  return new Promise((res) => {
+    const child = spawn(cmd, args, { ...opts });
+    child.stdout?.on("data", (d) => String(d).split("\n").filter(Boolean).forEach((l) => tec.log.push(l.slice(0, 160))));
+    child.stderr?.on("data", (d) => String(d).split("\n").filter(Boolean).forEach((l) => tec.log.push(l.slice(0, 160))));
+    child.on("error", (e) => { tec.log.push(`error: ${e.message}`); res(1); });
+    child.on("close", (code) => res(code));
+  });
+}
+
+async function installTectonic() {
+  if (tec.running) return;
+  if (latexEngine().engine) { tec.done = true; return; }
+  tec.running = true; tec.done = false; tec.error = ""; tec.log = [];
+  try {
+    mkdirSync(LOCAL_BIN, { recursive: true });
+    // 1) Homebrew (macOS/Linux) — most reliable when present.
+    if (which("brew")) {
+      tec.log.push("Installing tectonic via Homebrew… (a few minutes)");
+      const code = await spawnStream("brew", ["install", "tectonic"], {});
+      if (code === 0 && latexEngine().engine) { tec.done = true; tec.running = false; return; }
+      tec.log.push("brew path didn't succeed — trying a direct download…");
+    }
+    // 2) Direct binary from the official GitHub release (no brew needed).
+    const rel = await fetch("https://api.github.com/repos/tectonic-typesetting/tectonic/releases/latest", { headers: { "user-agent": "career-ops-studio" } }).then((r) => r.json());
+    const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+    const plat = process.platform === "darwin" ? "apple-darwin" : process.platform === "win32" ? "pc-windows-msvc" : "unknown-linux-gnu";
+    const asset = (rel.assets || []).find((a) => a.name.includes(arch) && a.name.includes(plat) && /tectonic/.test(a.name) && /\.(tar\.gz|zip)$/.test(a.name));
+    if (!asset) throw new Error("No prebuilt tectonic for this platform — install it manually (brew install tectonic).");
+    tec.log.push(`Downloading ${asset.name}…`);
+    const buf = Buffer.from(await fetch(asset.browser_download_url).then((r) => r.arrayBuffer()));
+    const tmp = join(LOCAL, asset.name);
+    writeFileSync(tmp, buf);
+    tec.log.push("Extracting…");
+    if (asset.name.endsWith(".zip")) await spawnStream("tar", ["-xf", tmp, "-C", LOCAL_BIN]);
+    else await spawnStream("tar", ["-xzf", tmp, "-C", LOCAL_BIN]);
+    const binName = process.platform === "win32" ? "tectonic.exe" : "tectonic";
+    const placed = join(LOCAL_BIN, binName);
+    if (existsSync(placed) && process.platform !== "win32") execFileSync("chmod", ["+x", placed]);
+    try { unlinkSync(tmp); } catch {}
+    if (!latexEngine().engine) throw new Error("Download finished but tectonic isn't runnable — try brew install tectonic.");
+    tec.done = true;
+  } catch (e) { tec.error = e.message; tec.log.push(`✗ ${e.message}`); }
+  tec.running = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,7 +1741,7 @@ RULES:
 
       // Structure the résumé into the shared JSON (faithful — no invention).
       const raw = await chat(s, [
-        { role: "system", content: `Convert the candidate's résumé into STRICT JSON (no fences):\n{"summary":"","competencies":[],"experience":[{"company":"","role":"","period":"","location":"","bullets":[]}],"projects":[{"title":"","desc":"","tech":""}],"education":[{"title":"degree","org":"school","year":"","location":"","coursework":[]}],"certifications":[{"title":"","org":"","year":""}],"skills":[{"category":"","items":"comma-separated"}]}\nFAITHFUL: only restructure what's in the résumé — never add employers, dates, metrics, or claims. Omit sections with no content (empty arrays).` },
+        { role: "system", content: `Convert the candidate's résumé into STRICT JSON (no fences):\n{"summary":"","competencies":[],"experience":[{"company":"","role":"","period":"","location":"","bullets":[]}],"projects":[{"title":"","desc":"","tech":""}],"education":[{"title":"degree","org":"school","year":"","location":"","coursework":[]}],"certifications":[{"title":"","org":"","year":""}],"skills":[{"category":"","items":"comma-separated"}]}\nFAITHFUL: only restructure what's in the résumé — never add employers, dates, metrics, or claims. Omit sections with no content (empty arrays).\nEVERY experience entry MUST have at least one bullet (its real responsibilities/achievements). Every project MUST have a non-empty desc.` },
         { role: "user", content: resumeMd.slice(0, 12000) },
       ], { maxTokens: 4096 });
       let data;
@@ -1678,28 +1764,55 @@ RULES:
       const gh = (candidate.github || "").replace(/^https?:\/\//, "");
       const payload = {
         name: candidate.full_name,
-        contact_line: [candidate.phone, candidate.email, li, candidate.location].filter(Boolean).join(" | "),
+        // email/linkedin/github render as icon links below, so keep the contact
+        // line to phone + location to avoid duplicating them.
+        contact_line: [candidate.phone, candidate.location].filter(Boolean).join(" | "),
         email: candidate.email ? { url: `mailto:${candidate.email}`, display: candidate.email } : {},
         linkedin: li ? { url: `https://${li}`, display: li } : {},
         github: gh ? { url: `https://${gh}`, display: gh } : {},
-        education: (data.education || []).map((e) => ({ institution: e.org || "", location: e.location || "", degree: e.title || "", dates: e.year || "", coursework: e.coursework || [] })),
-        experience: (data.experience || []).map((j) => ({ company: j.company || "", dates: j.period || "", role: j.role || "", location: j.location || "", bullets: j.bullets || [] })),
-        projects: (data.projects || []).map((p) => ({ name: p.title || "", context: p.tech || "", dates: "", bullets: [p.desc].filter(Boolean) })),
-        skills: (data.skills || []).map((sk) => ({ category: sk.category || "", items: sk.items || "" })),
+        education: (data.education || []).filter((e) => e && (e.org || e.title)).map((e) => ({ institution: e.org || "", location: e.location || "", degree: e.title || "", dates: e.year || "", coursework: (e.coursework || []).filter(Boolean) })),
+        // Every experience/project MUST carry ≥1 bullet — the repo's LaTeX
+        // builder emits a list wrapper unconditionally and an empty
+        // \resumeItemListStart…End makes tectonic fail with "missing \item".
+        experience: (data.experience || []).map((j) => ({ company: j.company || "", dates: j.period || "", role: j.role || "", location: j.location || "", bullets: (j.bullets || []).map((b) => String(b).trim()).filter(Boolean) })).filter((j) => (j.company || j.role) && j.bullets.length),
+        projects: (data.projects || []).map((p) => ({ name: p.title || "", context: p.tech || "", dates: "", bullets: [p.desc, ...(p.bullets || [])].map((b) => String(b || "").trim()).filter(Boolean) })).filter((p) => p.name && p.bullets.length),
+        skills: (data.skills || []).filter((sk) => sk && sk.category && sk.items).map((sk) => ({ category: sk.category, items: sk.items })),
       };
       const jsonPath = join(out, `cv-${slug}-${date}.payload.json`);
       const texPath = join(out, `cv-${slug}-${date}.tex`);
       writeFileSync(jsonPath, JSON.stringify(payload));
       const texRun = await runNode([join(ROOT, "build-cv-latex.mjs"), jsonPath, texPath], { timeoutMs: 30000 });
-      const texOk = existsSync(texPath);
-
-      // 3) Try to compile the .tex → PDF (tectonic/pdflatex). Best-effort.
-      let latexPdf = null, latexNote = "";
+      let texOk = existsSync(texPath);
+      // Strip empty sections: the template renders every section, and an empty
+      // \resumeSubHeadingListStart…End (e.g. no projects) is an empty LaTeX list
+      // that fails to compile ("missing \item"). Removing it also cleans the .tex.
       if (texOk) {
-        const latexPdfPath = join(out, `cv-${slug}-${date}-latex.pdf`);
-        const cr = await runNode([join(ROOT, "generate-latex.mjs"), texPath, latexPdfPath], { timeoutMs: 120000 }).catch(() => ({ code: 1, err: "compile error" }));
-        if (existsSync(latexPdfPath)) latexPdf = basename(latexPdfPath);
-        else latexNote = /tectonic|pdflatex|not found|command/i.test(cr.err || cr.out || "") ? "No LaTeX compiler installed — install tectonic (brew install tectonic) or open the .tex in Overleaf to get the LaTeX PDF." : "LaTeX compile failed; the .tex is still valid for Overleaf.";
+        let t = readFileSync(texPath, "utf8");
+        t = t.replace(/\\section\{[^}]*\}\s*\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd/g, "");
+        t = t.replace(/\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd/g, "");
+        writeFileSync(texPath, t);
+      }
+      // A tectonic-compatible variant: the template's \input{glyphtounicode} and
+      // \pdfgentounicode are pdfTeX-only and break under tectonic's XeTeX engine.
+      // (Overleaf uses pdflatex, so the downloadable .tex keeps them.)
+      const texForCompile = (raw) => raw
+        .replace(/^\s*\\input\{?glyphtounicode\}?.*$/gm, "")
+        .replace(/^\s*\\pdfgentounicode\s*=\s*1.*$/gm, "");
+
+      // 3) Compile the .tex → PDF with the detected engine. Uses a separate
+      //    compile file so the LaTeX PDF and the HTML PDF don't collide.
+      let latexPdf = null, latexNote = "", canInstall = false;
+      const eng = latexEngine();
+      if (texOk && eng.engine) {
+        const compileTex = join(out, `cv-${slug}-${date}-latex.tex`);
+        // For tectonic, drop the pdfTeX-only lines; for pdflatex, keep them.
+        writeFileSync(compileTex, eng.engine === "tectonic" ? texForCompile(readFileSync(texPath, "utf8")) : readFileSync(texPath, "utf8"));
+        const produced = compileLatex(compileTex, out);
+        if (produced && existsSync(produced)) latexPdf = basename(produced);
+        else latexNote = "LaTeX compile hit an error; the .tex is still valid for Overleaf.";
+      } else if (texOk) {
+        canInstall = true;
+        latexNote = "No LaTeX engine yet — install it once (one click) to compile the LaTeX PDF locally, or open the .tex in Overleaf.";
       }
 
       logEvent("resume_docs", { latex: !!latexPdf });
@@ -1708,9 +1821,17 @@ RULES:
         pdf: latexPdf || (htmlPdfOk ? htmlPdf : null),
         pdfEngine: latexPdf ? "latex" : "html",
         htmlPdf: htmlPdfOk ? htmlPdf : null,
-        latexNote,
+        latexNote, canInstall,
       });
     } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // LaTeX engine status + one-click install (tectonic).
+  "GET /api/latex-status": async (req, res) => ok(res, { state: tecState() }),
+  "POST /api/install-latex": async (req, res) => {
+    if (latexEngine().engine) return ok(res, { state: tecState() });
+    if (!tec.running) installTectonic().catch((e) => { tec.error = e.message; tec.running = false; });
+    ok(res, { state: tecState() });
   },
 
   // Serve a generated résumé file (pdf or tex) for download.
