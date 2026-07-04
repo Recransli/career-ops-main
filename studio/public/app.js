@@ -1383,11 +1383,9 @@ async function trackJob(job, w, status) {
 
 /* 7 — Track: everything after you hit submit */
 stages.track = async () => {
-  const [{ rows }, { cadence }, { plugins }] = await Promise.all([
-    api("/api/tracker"), api("/api/followups"), api("/api/plugins"),
+  const [ck, { cadence }, { plugins }] = await Promise.all([
+    api("/api/cockpit"), api("/api/followups"), api("/api/plugins"),
   ]);
-  const applied = rows.filter((r) => ["Applied", "Responded", "Interview", "Offer"].includes(r.status));
-  const days = (d) => Math.max(0, Math.round((Date.now() - new Date(d)) / 86400000));
   const cadenceFor = (company) => {
     const list = cadence?.followups || cadence?.applications || (Array.isArray(cadence) ? cadence : []);
     return list.find?.((c) => (c.company || "").toLowerCase() === company.toLowerCase());
@@ -1395,39 +1393,55 @@ stages.track = async () => {
   const gmail = plugins.find((p) => p.id === "gmail");
   const NEXT = { Applied: "Responded", Responded: "Interview", Interview: "Offer" };
 
+  // Lane 1 — to review (from the artifact store)
+  const reviewCards = ck.review.map((j) => `
+    <div class="lane-card" data-open-url="${esc(j.url || "")}" data-open-co="${esc(j.company || "")}" data-open-role="${esc(j.role || "")}">
+      <div class="lc-title">${esc(j.role || "role")}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(j.company || "")}</div>
+      <div class="row" style="margin-top:7px"><span class="pill ${j.prepared ? "ok" : "off"}">${j.prepared ? "prepared" : "evaluated"}</span>
+      <span class="score-badge ${j.score >= 4 ? "hi" : "lo"}" style="font-size:13px;padding:2px 8px;margin-left:auto">${j.score}/5</span></div>
+    </div>`).join("") || `<div class="empty" style="padding:20px 8px">Nothing to review.</div>`;
+
+  // Lane 2 — applied (monitor + follow-up)
+  const appliedCards = ck.applied.map((r) => {
+    const c = cadenceFor(r.company);
+    const nudge = c?.next_action || c?.action ? `Follow-up: ${c.next_action || c.action}` : (r.followUpDue ? `${r.daysSince}d silent — a polite nudge is fair now` : "");
+    return `
+    <div class="lane-card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
+      <div class="lc-title">${esc(r.role)}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(r.company)} · ${r.daysSince}d ago</div>
+      ${nudge ? `<div class="lc-note">${esc(nudge)}</div>` : ""}
+      <div class="row" style="margin-top:8px">
+        ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back →</button>` : ""}
+        <button class="btn small" data-status="Rejected">✕</button>
+      </div>
+    </div>`;
+  }).join("") || `<div class="empty" style="padding:20px 8px">No applications yet.</div>`;
+
+  // Lane 3 — interviewing (prep + roadmap)
+  const ivCards = ck.interviewing.map((r) => `
+    <div class="lane-card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
+      <div class="lc-title">${esc(r.role)}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(r.company)}${r.daysToInterview != null ? ` · in ${r.daysToInterview}d` : ""}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn small primary" data-prep>Prep</button>
+        <label class="hint" style="margin:0">📅<input type="date" data-ivdate value="${esc(r.interviewDate || "")}" style="width:auto;padding:3px 6px;font-size:12px"></label>
+        ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">→</button>` : ""}
+      </div>
+      <div class="prep-out" style="margin-top:8px"></div>
+    </div>`).join("") || `<div class="empty" style="padding:20px 8px">No interviews scheduled.</div>`;
+
   view.innerHTML = `
     <div class="stage">
       <div class="row">
-        <div style="flex:1">
-          <div class="page-title">Your applications</div>
-          <p class="page-sub">Everything you've applied to, with follow-up timing and interview prep. Update a status the moment you hear back — the whole system learns from it.</p>
-        </div>
-        <button class="btn" id="back-board">← Apply board</button>
+        <div style="flex:1"><div class="page-title">Pipeline</div>
+          <p class="page-sub">Your whole hunt on one board — jobs move left to right as they progress. Update a status the moment you hear back; the cockpit and prep react.</p></div>
       </div>
-      ${applied.length ? applied.map((r) => {
-        const c = cadenceFor(r.company);
-        const d = days(r.date);
-        return `
-        <div class="card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
-          <div class="row">
-            <div style="flex:1;min-width:0">
-              <h3 style="margin-bottom:2px">${esc(r.role)} — ${esc(r.company)}</h3>
-              <span class="hint">applied ${esc(r.date)} · ${d} day${d === 1 ? "" : "s"} ago${r.score && r.score !== "-" ? ` · fit ${esc(r.score)}` : ""}</span>
-            </div>
-            <span class="pill ${r.status === "Applied" ? "off" : "ok"}">${esc(r.status)}</span>
-          </div>
-          ${c?.next_action || c?.action ? `<div class="note" style="margin:10px 0 4px">Follow-up: ${esc(c.next_action || c.action)}${c.due || c.next_date ? ` · ${esc(c.due || c.next_date)}` : ""}</div>`
-            : d >= 7 && r.status === "Applied" ? `<div class="note" style="margin:10px 0 4px">${d} days with no response — a short, polite follow-up is reasonable now.</div>` : ""}
-          <div class="row" style="margin-top:10px">
-            <button class="btn small primary" data-prep>Prep for interview</button>
-            <label class="hint" style="margin:0">Interview date <input type="date" data-ivdate style="width:auto;padding:4px 8px;font-size:12.5px"></label>
-            ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back → ${NEXT[r.status]}</button>` : ""}
-            ${r.status !== "Offer" ? `<button class="btn small" data-status="Rejected">Rejected</button>` : ""}
-          </div>
-          <div class="prep-out" style="margin-top:10px"></div>
-          ${r.notes ? `<p class="hint" style="margin-top:8px">${esc(r.notes)}</p>` : ""}
-        </div>`;
-      }).join("") : `<div class="card"><div class="empty">Nothing applied yet — when you hit “I applied” on the board, jobs land here.</div></div>`}
+      <div class="lanes">
+        <div class="lane"><div class="lane-head">To review <span>${ck.counts.review}</span></div><div class="lane-body" id="lane-review">${reviewCards}</div></div>
+        <div class="lane"><div class="lane-head">Applied${ck.counts.followUpsDue ? ` · ${ck.counts.followUpsDue} due` : ""} <span>${ck.counts.applied}</span></div><div class="lane-body">${appliedCards}</div></div>
+        <div class="lane"><div class="lane-head">Interviewing <span>${ck.counts.interviewing}</span></div><div class="lane-body">${ivCards}</div></div>
+      </div>
       <div class="card">
         <div class="row"><h3 style="margin-right:auto">Inbox connectors</h3></div>
         <p class="hint">Connect your email so recruiter replies land in your pipeline and statuses stay in sync — nothing leaves your machine except to your own provider.</p>
@@ -1446,10 +1460,14 @@ stages.track = async () => {
       </div>
     </div>`;
 
-  $("#back-board").addEventListener("click", () => go(6));
+  // Review cards open in the Apply workspace.
+  $$("#lane-review .lane-card").forEach((el) => el.addEventListener("click", () => {
+    state.pendingOpen = { url: el.dataset.openUrl || null, company: el.dataset.openCo, role: el.dataset.openRole };
+    go(IDX.board);
+  }));
   // Interview prep, two steps: AI suggests topics → you pick → roadmap to date.
   $$("#view [data-prep]").forEach((b) => b.addEventListener("click", async () => {
-    const card = b.closest(".card");
+    const card = b.closest(".lane-card, .card");
     const out = card.querySelector(".prep-out");
     const co = card.dataset.co, role = card.dataset.role;
     b.disabled = true;
@@ -1480,7 +1498,7 @@ stages.track = async () => {
     b.disabled = false;
   }));
   $$("#view [data-status]").forEach((b) => b.addEventListener("click", async () => {
-    const card = b.closest(".card");
+    const card = b.closest(".lane-card, .card");
     try {
       await api("/api/track", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role, status: b.dataset.status } });
       toast(`${card.dataset.co} → ${b.dataset.status}`);
