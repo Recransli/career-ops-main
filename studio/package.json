@@ -8,7 +8,8 @@
     "start": "node server.mjs",
     "dev": "node server.mjs",
     "build:roles": "node scripts/build-roles.mjs",
-    "build:boards": "node scripts/build-boards.mjs"
+    "build:boards": "node scripts/build-boards.mjs",
+    "test": "node scripts/smoke.mjs"
   },
   "engines": {
     "node": ">=18"

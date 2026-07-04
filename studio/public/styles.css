@@ -519,3 +519,10 @@ main#view {
 .connectors { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .connector { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--surface); }
 .connector.on { border-color: var(--good); }
+
+/* server health dot */
+.health { display: inline-flex; align-items: center; padding: 6px 8px; }
+.health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); transition: background .3s; }
+.health.ok .health-dot { background: var(--good); box-shadow: 0 0 0 3px var(--good-soft); }
+.health.down .health-dot { background: #c0392b; box-shadow: 0 0 0 3px #f7d9d3; animation: pulse-down 1.2s infinite; }
+@keyframes pulse-down { 50% { opacity: .4; } }

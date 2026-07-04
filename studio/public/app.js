@@ -1472,6 +1472,31 @@ function initAsk() {
 }
 initAsk();
 
+/* ── Server health indicator (fixes silent 'paste the JD' on crash) ── */
+function initHealth() {
+  const el = $("#health");
+  if (!el) return;
+  let fails = 0;
+  const ping = async () => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch("/api/status", { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) throw new Error();
+      fails = 0;
+      el.className = "health ok";
+      el.title = "Studio connected";
+    } catch {
+      fails++;
+      if (fails >= 2) { el.className = "health down"; el.title = "Studio server not responding — restart: node studio/server.mjs"; }
+    }
+  };
+  ping();
+  setInterval(ping, 8000);
+}
+initHealth();
+
 /* ── boot: resume the journey where the user left off ──── */
 (async function boot() {
   try {
