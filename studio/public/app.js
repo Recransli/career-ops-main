@@ -1412,9 +1412,11 @@ stages.track = async () => {
       <div class="hint" style="margin:2px 0 0">${esc(r.company)} · ${r.daysSince}d ago</div>
       ${nudge ? `<div class="lc-note">${esc(nudge)}</div>` : ""}
       <div class="row" style="margin-top:8px">
+        <button class="btn small" data-followup data-days="${r.daysSince}">Follow-up ✎</button>
         ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back →</button>` : ""}
         <button class="btn small" data-status="Rejected">✕</button>
       </div>
+      <div class="followup-out"></div>
     </div>`;
   }).join("") || `<div class="empty" style="padding:20px 8px">No applications yet.</div>`;
 
@@ -1453,8 +1455,15 @@ stages.track = async () => {
               : `<p class="hint">Read-only via career-ops' Gmail plugin (your own OAuth). Enable <code>gmail</code> in <code>config/plugins.yml</code> + add ${esc((gmail?.missingEnv || ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]).join(", "))} to <code>.env</code>.</p><a class="btn small" href="https://github.com/santifer/career-ops/blob/main/docs/PLUGINS.md" target="_blank">Setup guide</a>`}
           </div>
           <div class="connector">
+            <div class="row"><b style="margin-right:auto">📥 Paste a recruiter reply</b></div>
+            <p class="hint">No connector needed — paste any recruiter email and Studio suggests the status update.</p>
+            <textarea id="infer-text" placeholder="Paste the recruiter's message…" style="min-height:70px"></textarea>
+            <div class="row" style="margin-top:6px"><button class="btn small" id="infer-btn">Read & suggest status</button></div>
+            <div id="infer-out"></div>
+          </div>
+          <div class="connector">
             <div class="row"><b style="margin-right:auto">📅 Outlook / Microsoft 365</b><span class="pill off">planned</span></div>
-            <p class="hint">Outlook connector is on the roadmap — the same read-only, local-first model. For now, forward recruiter mail to a Gmail label, or add postings manually on the board.</p>
+            <p class="hint">Outlook connector is on the roadmap — the same read-only, local-first model.</p>
           </div>
         </div>
       </div>
@@ -1505,6 +1514,36 @@ stages.track = async () => {
       stages.track();
     } catch (e) { toast(e.message, true); }
   }));
+  // Auto-draft a follow-up email
+  $$("#view [data-followup]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".lane-card");
+    const out = card.querySelector(".followup-out");
+    b.disabled = true;
+    out.innerHTML = `<div class="empty" style="padding:8px">${spin} Drafting…</div>`;
+    try {
+      const r = await api("/api/followup-draft", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role, days: +b.dataset.days } });
+      out.innerHTML = `<div class="followup-draft"><pre>${esc(r.draft)}</pre><button class="btn small" data-copy-fu>Copy</button></div>`;
+      out.querySelector("[data-copy-fu]").addEventListener("click", () => copyText(r.draft, "Follow-up copied"));
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+    b.disabled = false;
+  }));
+  // Infer status from a pasted recruiter reply
+  $("#infer-btn")?.addEventListener("click", async () => {
+    const text = $("#infer-text").value.trim();
+    if (!text) return toast("Paste the recruiter's message", true);
+    $("#infer-out").innerHTML = `<div class="empty">${spin} Reading…</div>`;
+    try {
+      const r = await api("/api/infer-status", { method: "POST", body: { text } });
+      $("#infer-out").innerHTML = `<div class="note">Looks like <b>${esc(r.status)}</b>${r.company ? ` — ${esc(r.company)}` : ""} <span class="pill off">${esc(r.confidence)}</span><br>${esc(r.summary || "")}</div>
+        <div class="row"><input type="text" id="infer-co" placeholder="Company" value="${esc(r.company || "")}"><input type="text" id="infer-role" placeholder="Role"><button class="btn small primary" id="infer-apply">Set status → ${esc(r.status)}</button></div>`;
+      $("#infer-apply").addEventListener("click", async () => {
+        const co = $("#infer-co").value.trim(), role = $("#infer-role").value.trim();
+        if (!co || !role) return toast("Fill company + role to match the application", true);
+        try { await api("/api/track", { method: "POST", body: { company: co, role, status: r.status } }); toast(`${co} → ${r.status}`); stages.track(); }
+        catch (e) { toast(e.message, true); }
+      });
+    } catch (e) { $("#infer-out").innerHTML = ""; toast(e.message, true); }
+  });
   $("#gmail-run")?.addEventListener("click", async () => {
     const out = $("#gmail-out");
     out.innerHTML = `<div class="empty">${spin} Checking your labelled inbox…</div>`;

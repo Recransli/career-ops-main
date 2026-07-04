@@ -702,6 +702,32 @@ function detectAts(url) {
   } catch { return null; }
 }
 
+// Deterministic daily digest (no model) — what needs attention today.
+function buildDigest() {
+  const store = loadJobs();
+  const rows = parseTracker();
+  const appliedKeys = new Set(rows.filter((r) => ["Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"].includes(r.status)).map((r) => `${r.company.toLowerCase()}|${r.role.toLowerCase()}`));
+  const review = Object.values(store).filter((j) => j.score != null && !appliedKeys.has(`${(j.company || "").toLowerCase()}|${(j.role || "").toLowerCase()}`));
+  const prepared = review.filter((j) => j.pdf && j.letter);
+  const days = (d) => Math.max(0, Math.round((Date.now() - new Date(d)) / 86400000));
+  const applied = rows.filter((r) => r.status === "Applied");
+  const followUps = applied.filter((r) => days(r.date) >= 7);
+  const interviews = rows.filter((r) => r.status === "Interview");
+  const date = new Date().toISOString().slice(0, 10);
+  const lines = [
+    `# Career-Ops Studio — daily digest · ${date}`, "",
+    `**${prepared.length}** application${prepared.length === 1 ? "" : "s"} prepared and ready to review${review.length > prepared.length ? ` (+${review.length - prepared.length} evaluated)` : ""}.`,
+    followUps.length ? `**${followUps.length}** follow-up${followUps.length === 1 ? "" : "s"} due (7+ days silent): ${followUps.map((r) => `${r.company}`).join(", ")}.` : "No follow-ups due.",
+    interviews.length ? `**${interviews.length}** interview${interviews.length === 1 ? "" : "s"} in progress: ${interviews.map((r) => `${r.company}`).join(", ")}.` : "",
+    "",
+    prepared.length ? "## Ready to review\n" + prepared.slice(0, 10).map((j) => `- ${j.role} @ ${j.company} — ${j.score}/5`).join("\n") : "",
+  ].filter(Boolean);
+  const digest = lines.join("\n") + "\n";
+  mkdirSync(LOCAL, { recursive: true });
+  writeFileSync(join(LOCAL, "digest.md"), digest);
+  return digest;
+}
+
 // ---------------------------------------------------------------------------
 // Daily scheduler — refresh the inventory (scan) every day at a set hour.
 // In-process: works while the server runs. For always-on, install the launchd
@@ -730,6 +756,7 @@ function armScheduler() {
       sched.lastRun = Date.now();
       sched.lastResult = (r.out + r.err).trim().split("\n").slice(-3).join(" | ");
       logEvent("scheduled_scan", { code: r.code });
+      try { buildDigest(); } catch { /* best effort */ }
       if (cfg.autoEval && !bg.running) runBackground({ threshold: 4, limit: 25 }).catch(() => {});
     } catch (e) { sched.lastResult = `error: ${e.message}`; }
     armScheduler(); // reschedule for tomorrow
@@ -1469,6 +1496,48 @@ RULES:
       ok(res, { plan, file: `interview-prep/${basename(prepPath)}` });
     } catch (e) { fail(res, e.message, 502); }
   },
+
+  // Draft a short, polite follow-up email for an applied job — grounded in
+  // the résumé + how long it's been. The user copies/sends it themselves.
+  "POST /api/followup-draft": async (req, res) => {
+    const { company, role, days } = await body(req);
+    if (!company || !role) return fail(res, "company and role required");
+    try {
+      const profile = loadYaml(P.profile) || {};
+      const name = scrubCandidate(profile.candidate).full_name || "";
+      const draft = await chat(loadSettings(), [
+        { role: "system", content: `Write a SHORT, warm, professional follow-up email for a job the candidate applied to${days ? ` ${days} days ago` : ""}. 90–130 words. Reaffirm genuine interest, add one concrete sentence of value tied to the role, ask about next steps. No clichés, no desperation, no invented facts. Sign as ${name || "the candidate"}. Output only the email (subject line + body).` },
+        { role: "user", content: `Role: ${role} at ${company}.` },
+      ], { maxTokens: 500 });
+      logEvent("followup_draft", { company });
+      ok(res, { draft });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // Infer an application status from a pasted recruiter email / reply. Suggests
+  // a canonical status; the user confirms. (Works without Gmail OAuth.)
+  "POST /api/infer-status": async (req, res) => {
+    const { text } = await body(req);
+    if (!text || text.trim().length < 15) return fail(res, "Paste the recruiter's message.");
+    try {
+      const raw = await chat(loadSettings(), [
+        { role: "system", content: `Classify this recruiter/company message about a job application. Output STRICT JSON only: {"status":"Responded|Interview|Offer|Rejected","company":"<if stated>","confidence":"high|medium|low","summary":"one line"}. Interview = they propose/schedule an interview or next round. Responded = generic acknowledgement or "reviewing". Rejected = declined/moving on. Offer = job offer.` },
+        { role: "user", content: text.slice(0, 3000) },
+      ], { maxTokens: 300 });
+      let out = null; try { out = JSON.parse((raw.match(/\{[\s\S]*\}/) || [])[0]); } catch { /* tolerate */ }
+      if (!out) return fail(res, "Couldn't classify — try again.", 502);
+      logEvent("infer_status", { status: out.status });
+      ok(res, out);
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // Daily digest — a plain-language summary of the cockpit state, written to
+  // .local/digest.md (also returned). The scheduler can refresh it each day.
+  "POST /api/digest": async (req, res) => {
+    try { ok(res, { digest: await buildDigest() }); }
+    catch (e) { fail(res, e.message, 502); }
+  },
+  "GET /api/digest": async (req, res) => ok(res, { digest: read(join(LOCAL, "digest.md")) || "" }),
 
   // Interview prep — step 1: AI suggests topics to prepare, from the JD/eval
   // gap vs. the résumé. The user picks which ones matter to them.
