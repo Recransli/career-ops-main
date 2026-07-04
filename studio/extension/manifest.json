@@ -6,6 +6,13 @@
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["http://localhost:4949/*", "http://127.0.0.1:4949/*"],
   "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://boards.greenhouse.io/*", "https://job-boards.greenhouse.io/*", "https://jobs.lever.co/*", "https://jobs.ashbyhq.com/*", "https://*.myworkdayjobs.com/*", "https://apply.workable.com/*"],
+      "js": ["submit-watch.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Fill from Studio"

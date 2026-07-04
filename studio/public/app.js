@@ -685,21 +685,80 @@ stages.roles = async () => {
 /* 5 — Scan / Discover */
 stages.scan = async () => {
   const s = await loadStatus();
+  const boards = await api("/api/boards");
+  const chosen = { boards: new Set(boards.enabledBoards), companies: new Set(boards.enabledCompanies) };
+  let boardFilter = "";
   view.innerHTML = `
     <div class="stage stage-narrow">
       <div class="page-title">Discover openings</div>
-      <p class="page-sub">Studio queries 40+ job-board APIs directly (Greenhouse, Lever, Ashby…) with your keywords and locations — no AI tokens spent, nothing sent anywhere. New matches land in your inbox.</p>
-      <div class="card" style="text-align:center;padding:34px">
-        <div style="font-family:var(--serif);font-size:40px;font-weight:700">${s.pipeline}</div>
-        <p class="hint">postings currently in your inbox</p>
-        <button class="btn primary" id="scan-btn" style="margin-top:8px">Scan portals now</button>
-        <div id="scan-out" style="text-align:left;margin-top:14px"></div>
+      <p class="page-sub">Pick which boards and companies to scan, then Studio queries their public APIs directly with your role keywords and locations — no AI tokens, nothing sent anywhere. Precise keywords (from your target roles) keep false positives down.</p>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Remote & aggregator boards</h3><span class="hint" id="board-count"></span></div>
+        <div class="board-grid" id="remote-boards">
+          ${boards.remoteBoards.map((b) => `
+            <label class="board-opt"><input type="checkbox" data-board="${esc(b.id)}" ${chosen.boards.has(b.id) ? "checked" : ""}>
+            <span><b>${esc(b.name)}</b><br><span class="hint">${esc(b.desc)}</span></span></label>`).join("")}
+        </div>
       </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Direct company career sites</h3>
+          <button class="btn small" id="co-all">Select all</button><button class="btn small" id="co-none">Clear</button></div>
+        <input type="text" id="co-filter" placeholder="Filter ${boards.companies.length} companies — name or tag (ai, fintech, remote…)" style="margin-bottom:8px">
+        <div class="board-grid" id="company-list"></div>
+        ${boards.otherEnabledCompanies?.length ? `<p class="hint" style="margin-top:8px">Plus ${boards.otherEnabledCompanies.length} companies already in your portals.yml (kept as-is).</p>` : ""}
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">${s.pipeline} in your inbox</h3>
+          <button class="btn" id="save-boards">Save selection</button>
+          <button class="btn primary" id="scan-btn">Scan now</button></div>
+        <div id="scan-out" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Background evaluation</h3>
+          <span class="hint" id="bg-status"></span></div>
+        <p class="hint">Let Studio evaluate your inbox in the background and auto-prepare everything (tailored PDF + cover letter) for strong matches — so when you sit down, high-fit jobs are ready.</p>
+        <div class="row">
+          <label class="hint" style="margin:0">Auto-prepare at ≥ <select id="bg-threshold" style="width:auto;padding:4px 8px"><option>4</option><option>4.5</option><option>3.5</option></select> /5</label>
+          <label class="hint" style="margin:0">Up to <input type="number" id="bg-limit" value="15" min="1" max="100" style="width:70px;padding:4px 8px"> jobs</label>
+          <button class="btn primary" id="bg-start">Start</button>
+          <button class="btn" id="bg-stop">Stop</button>
+        </div>
+        <div id="bg-progress" style="margin-top:10px"></div>
+      </div>
+
       ${stageNav({ backTo: 4, onNext: true, nextLabel: "To the applications →" })}
     </div>`;
+
+  // company list (filterable)
+  const renderCompanies = () => {
+    const f = boardFilter.toLowerCase();
+    const list = boards.companies.filter((c) => !f || c.name.toLowerCase().includes(f) || (c.tags || []).some((t) => t.includes(f)) || c.provider.includes(f));
+    $("#company-list").innerHTML = list.map((c) => `
+      <label class="board-opt"><input type="checkbox" data-company="${esc(c.name)}" ${chosen.companies.has(c.name) ? "checked" : ""}>
+      <span><b>${esc(c.name)}</b> <span class="pill off">${esc(c.provider)}</span><br><span class="hint">${esc((c.tags || []).join(", "))}</span></span></label>`).join("") || `<div class="empty">no matches</div>`;
+    $$("#company-list [data-company]").forEach((cb) => cb.addEventListener("change", () => cb.checked ? chosen.companies.add(cb.dataset.company) : chosen.companies.delete(cb.dataset.company)));
+    updateCount();
+  };
+  const updateCount = () => { $("#board-count").textContent = `${chosen.boards.size} boards · ${chosen.companies.size} companies`; };
+  $("#co-filter").addEventListener("input", (e) => { boardFilter = e.target.value; renderCompanies(); });
+  $("#co-all").addEventListener("click", () => { boards.companies.forEach((c) => chosen.companies.add(c.name)); renderCompanies(); });
+  $("#co-none").addEventListener("click", () => { chosen.companies.clear(); renderCompanies(); });
+  $$("#remote-boards [data-board]").forEach((cb) => cb.addEventListener("change", () => { cb.checked ? chosen.boards.add(cb.dataset.board) : chosen.boards.delete(cb.dataset.board); updateCount(); }));
+  renderCompanies();
+
+  const saveBoards = async () => {
+    await api("/api/boards", { method: "POST", body: { boards: [...chosen.boards], companies: [...chosen.companies] } });
+    toast(`Saved ${chosen.boards.size} boards + ${chosen.companies.size} companies`);
+  };
+  $("#save-boards").addEventListener("click", saveBoards);
   $("#scan-btn").addEventListener("click", async () => {
+    await saveBoards();
     $("#scan-btn").disabled = true;
-    $("#scan-out").innerHTML = `<div class="empty">${spin} Scanning… a couple of minutes.</div>`;
+    $("#scan-out").innerHTML = `<div class="empty">${spin} Scanning selected boards… a couple of minutes.</div>`;
     try {
       const r = await api("/api/scan", { method: "POST", body: {} });
       $("#scan-out").innerHTML = `<pre class="log">${esc(r.output)}</pre>`;
@@ -708,6 +767,25 @@ stages.scan = async () => {
     } catch (e) { $("#scan-out").innerHTML = ""; toast(e.message, true); }
     $("#scan-btn").disabled = false;
   });
+
+  // background eval controls + polling
+  let bgTimer;
+  const renderBg = (st) => {
+    $("#bg-status").textContent = st.running ? `running — ${st.done}/${st.total}` : st.error ? `error: ${st.error}` : st.done ? `done — ${st.prepared} prepared` : "";
+    $("#bg-progress").innerHTML = (st.running || st.log?.length)
+      ? `${st.running ? `<div class="hint">${spin} ${esc(st.current || "…")}</div>` : ""}
+         ${st.log?.length ? `<pre class="log">${esc(st.log.join("\n"))}</pre>` : ""}` : "";
+  };
+  const poll = async () => { try { const { state: st } = await api("/api/background"); renderBg(st); if (!st.running) { clearInterval(bgTimer); bgTimer = null; state.status = null; } } catch {} };
+  api("/api/background").then(({ state: st }) => { renderBg(st); if (st.running && !bgTimer) bgTimer = setInterval(poll, 4000); });
+  $("#bg-start").addEventListener("click", async () => {
+    try {
+      const { state: st } = await api("/api/background", { method: "POST", body: { action: "start", threshold: parseFloat($("#bg-threshold").value), limit: parseInt($("#bg-limit").value) } });
+      renderBg(st); toast("Background evaluation started"); if (!bgTimer) bgTimer = setInterval(poll, 4000);
+    } catch (e) { toast(e.message, true); }
+  });
+  $("#bg-stop").addEventListener("click", async () => { const { state: st } = await api("/api/background", { method: "POST", body: { action: "stop" } }); renderBg(st); toast("Stopping after the current job…"); });
+
   wireNav(4, () => go(6));
 };
 
@@ -1207,10 +1285,20 @@ stages.track = async () => {
         </div>`;
       }).join("") : `<div class="card"><div class="empty">Nothing applied yet — when you hit “I applied” on the board, jobs land here.</div></div>`}
       <div class="card">
-        <h3>Inbox monitoring (Gmail)</h3>
-        ${gmail?.enabled
-          ? `<p class="hint">Gmail plugin enabled — pull job-related email leads into your pipeline.</p><button class="btn" id="gmail-run">Pull from Gmail</button><div id="gmail-out"></div>`
-          : `<p class="hint">career-ops ships a read-only Gmail plugin: label the recruiter emails in Gmail and it pulls them into your pipeline, so responses never slip through. To enable: set <code>gmail: enabled</code> in <code>config/plugins.yml</code> and add ${esc((gmail?.missingEnv || ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]).join(", "))} to <code>.env</code> (your own OAuth credentials — nothing is shared). Then this card becomes a one-click inbox check.</p>`}
+        <div class="row"><h3 style="margin-right:auto">Inbox connectors</h3></div>
+        <p class="hint">Connect your email so recruiter replies land in your pipeline and statuses stay in sync — nothing leaves your machine except to your own provider.</p>
+        <div class="connectors">
+          <div class="connector ${gmail?.enabled ? "on" : ""}">
+            <div class="row"><b style="margin-right:auto">✉️ Gmail</b><span class="pill ${gmail?.enabled ? "ok" : "off"}">${gmail?.enabled ? "connected" : "not connected"}</span></div>
+            ${gmail?.enabled
+              ? `<p class="hint">Label recruiter emails in Gmail; Studio pulls them in.</p><button class="btn small" id="gmail-run">Pull from Gmail</button><div id="gmail-out"></div>`
+              : `<p class="hint">Read-only via career-ops' Gmail plugin (your own OAuth). Enable <code>gmail</code> in <code>config/plugins.yml</code> + add ${esc((gmail?.missingEnv || ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]).join(", "))} to <code>.env</code>.</p><a class="btn small" href="https://github.com/santifer/career-ops/blob/main/docs/PLUGINS.md" target="_blank">Setup guide</a>`}
+          </div>
+          <div class="connector">
+            <div class="row"><b style="margin-right:auto">📅 Outlook / Microsoft 365</b><span class="pill off">planned</span></div>
+            <p class="hint">Outlook connector is on the roadmap — the same read-only, local-first model. For now, forward recruiter mail to a Gmail label, or add postings manually on the board.</p>
+          </div>
+        </div>
       </div>
     </div>`;
 

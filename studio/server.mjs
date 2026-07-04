@@ -207,6 +207,40 @@ function syncContactFromCv(cv) {
   writeFileSync(P.profile, yaml.dump(profile, { lineWidth: 120 }));
 }
 
+// Build a precise title_filter from chosen role titles. The scanner passes a
+// job if ANY positive keyword matches, so positives must be PHRASES (or
+// distinctive multi-word/compound terms) — never bare words like "Engineer"
+// that match everything. That over-broad matching was the false-positive source.
+const GENERIC_WORDS = new Set(["engineer", "developer", "manager", "analyst", "scientist", "specialist", "consultant", "designer", "architect", "lead", "senior", "junior", "staff", "principal", "associate", "director", "head", "of", "and", "the", "a", "an"]);
+// Distinctive single tokens worth matching on their own (domain signals).
+const STRONG_TOKENS = new Set(["ml", "ai", "llm", "nlp", "genai", "mlops", "llmops", "devops", "sre", "data", "backend", "frontend", "fullstack", "full-stack", "security", "cloud", "kubernetes", "platform", "infrastructure", "cybersecurity", "blockchain", "robotics", "embedded", "qa", "sdet", "ux", "ui", "product", "growth", "sales", "marketing", "finance", "recruiter", "designer"]);
+
+function buildTitleFilter(chosen) {
+  const positive = new Set();
+  for (const raw of chosen) {
+    const t = raw.trim();
+    if (!t) continue;
+    positive.add(t); // the full title is always a good phrase
+    const words = t.split(/\s+/);
+    // meaningful bigrams (drop ones that are two generic words)
+    for (let i = 0; i < words.length - 1; i++) {
+      const a = words[i].toLowerCase(), b = words[i + 1].toLowerCase();
+      if (GENERIC_WORDS.has(a) && GENERIC_WORDS.has(b)) continue;
+      positive.add(`${words[i]} ${words[i + 1]}`);
+    }
+    // distinctive single tokens only
+    for (const w of words) {
+      const lw = w.toLowerCase().replace(/[^a-z0-9-]/g, "");
+      if (STRONG_TOKENS.has(lw)) positive.add(w);
+    }
+  }
+  return {
+    positive: [...positive],
+    negative: ["Intern", "Internship", "Apprentice", "Working Student", "Trainee", "Co-op", "Graduate Program", "Contract", "Volunteer"],
+    seniority_boost: ["Senior", "Staff", "Principal", "Lead", "Head", "Director"],
+  };
+}
+
 function ensureProfile() {
   if (!existsSync(P.profile)) {
     mkdirSync(dirname(P.profile), { recursive: true });
@@ -621,6 +655,89 @@ function fillCvTemplate(data, candidate) {
 }
 
 // ---------------------------------------------------------------------------
+// Background evaluation worker (single instance, in-memory state)
+// ---------------------------------------------------------------------------
+const bg = { running: false, stop: false, done: 0, total: 0, prepared: 0, current: "", error: "", log: [] };
+const bgState = () => ({ running: bg.running, stop: bg.stop, done: bg.done, total: bg.total, prepared: bg.prepared, current: bg.current, error: bg.error, log: bg.log.slice(-8) });
+
+async function bgEvaluate(jd) {
+  const s = loadSettings();
+  mkdirSync(P.jds, { recursive: true });
+  const jdFile = join(P.jds, `bg-${Date.now()}.txt`);
+  writeFileSync(jdFile, jd);
+  const args = s.provider === "ollama"
+    ? [join(ROOT, "ollama-eval.mjs"), "--model", s.model, "--url", s.baseUrl, "--file", jdFile]
+    : [join(ROOT, "openai-eval.mjs"), "--url", s.baseUrl, "--model", s.model, ...(s.apiKey ? ["--key", s.apiKey] : []), "--file", jdFile];
+  const r = await runNode(args);
+  const reportRel = (r.out.match(/reports\/[\w.\-]+\.md/) || [])[0] || null;
+  const report = reportRel ? read(join(ROOT, reportRel)) : null;
+  const score = report ? parseFloat((report.match(/(\d(?:\.\d)?)\s*\/\s*5/) || [])[1]) || null : null;
+  return { report, reportRel, score };
+}
+
+async function runBackground({ threshold, limit }) {
+  bg.running = true; bg.stop = false; bg.done = 0; bg.prepared = 0; bg.error = ""; bg.log = [];
+  const s = loadSettings();
+  if (!s.model) { bg.error = "No model selected"; bg.running = false; return; }
+  const items = parsePipeline().slice(0, limit);
+  bg.total = items.length;
+  const store = loadJobs();
+  for (const it of items) {
+    if (bg.stop) break;
+    const key = jobKey({ url: it.url });
+    if (store[key]?.score != null) { bg.done++; continue; } // already evaluated
+    bg.current = it.title || it.url;
+    try {
+      const jd = await fetchJdFromUrl(it.url).catch(() => null);
+      if (!jd?.text || jd.text.length < 120) { bg.log.push(`skip (no JD): ${it.title}`); bg.done++; continue; }
+      const company = (jd.company || it.company || "").replace(/\b\w/g, (c) => c.toUpperCase());
+      const role = jd.title || it.title;
+      const { report, reportRel, score } = await bgEvaluate(jd.text);
+      const patch = { report, reportPath: reportRel, score, company, role };
+      await trackApplication({ company, role, status: "Evaluated", score, reportPath: reportRel, note: "auto (background)" }).catch(() => {});
+      bg.log.push(`${score ?? "?"}/5 — ${role} @ ${company}`);
+      logEvent("bg_evaluate", { score });
+
+      // High scorer → auto-prepare everything
+      if (score != null && score >= threshold && !bg.stop) {
+        bg.current = `preparing ${role} (${score}/5)`;
+        const context = [report && `FIT:\n${report}`, ""].filter(Boolean).join("\n\n");
+        try {
+          const profile = loadYaml(P.profile) || {};
+          const candidate = scrubCandidate(profile.candidate);
+          if (candidate.full_name && candidate.email) {
+            const rawTailor = await chat(s, [
+              { role: "system", content: `You tailor resumes.\n\n${groundingContext()}\n\n${GROUNDING_RULES}\n\n${TAILOR_JSON_PROMPT}\n\n${context}` },
+              { role: "user", content: `Company: ${company} — Role: ${role}\n\nJD:\n${jd.text.slice(0, 8000)}` },
+            ], { maxTokens: 4096 });
+            const data = JSON.parse((rawTailor.match(/\{[\s\S]*\}/) || ["{}"])[0]);
+            const slug = slugify(`${candidate.full_name.split(" ")[0]}-${company}`);
+            const date = new Date().toISOString().slice(0, 10);
+            const htmlPath = join(ROOT, "output", `cv-${slug}-${date}.html`);
+            const pdfPath = join(ROOT, "output", `cv-${slug}-${date}.pdf`);
+            mkdirSync(join(ROOT, "output"), { recursive: true });
+            writeFileSync(htmlPath, fillCvTemplate(data, candidate));
+            await runNode([join(ROOT, "generate-pdf.mjs"), htmlPath, pdfPath, "--format=letter"], { timeoutMs: 120000 });
+            if (existsSync(pdfPath)) patch.pdf = basename(pdfPath);
+          }
+          const letter = await chat(s, [
+            { role: "system", content: `You write cover letters.\n\n${groundingContext()}\n\n${GROUNDING_RULES}\n\n3–4 short paragraphs, markdown only.` },
+            { role: "user", content: `Cover letter for ${role} at ${company}.\n\nJD:\n${jd.text.slice(0, 4000)}` },
+          ], { maxTokens: 1200 });
+          patch.letter = letter;
+          bg.prepared++;
+          logEvent("bg_prepared", { score });
+        } catch (e) { bg.log.push(`prep failed: ${e.message.slice(0, 60)}`); }
+      }
+      saveJobArtifact(key, patch);
+    } catch (e) { bg.log.push(`error: ${e.message.slice(0, 60)}`); }
+    bg.done++;
+  }
+  bg.current = "";
+  bg.running = false;
+}
+
+// ---------------------------------------------------------------------------
 // Request plumbing
 // ---------------------------------------------------------------------------
 const MIME = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
@@ -713,17 +830,61 @@ const routes = {
 
     ensurePortals();
     const portals = loadYaml(P.portals) || {};
-    // Keywords: the role titles plus distinctive words from them (dedup, keep short).
-    const words = new Set();
-    for (const t of chosen) {
-      words.add(t);
-      for (const w of t.split(/\s+/)) if (w.length > 3 && !/^(and|the|of)$/i.test(w)) words.add(w);
-    }
-    portals.title_filter = portals.title_filter || {};
-    portals.title_filter.positive = [...words];
+    portals.title_filter = buildTitleFilter(chosen);
     writeFileSync(P.portals, yaml.dump(portals, { lineWidth: 120 }));
     ensureTracker();
-    ok(res, { saved: true, keywords: [...words] });
+    ok(res, { saved: true, keywords: portals.title_filter.positive });
+  },
+
+  // Job boards + companies picker. Returns the catalog plus which are enabled
+  // in the user's portals.yml right now.
+  "GET /api/boards": async (req, res) => {
+    const catalog = JSON.parse(readFileSync(join(STUDIO, "data", "boards.json"), "utf8"));
+    const portals = loadYaml(P.portals) || {};
+    const enabledBoards = new Set((portals.job_boards || []).filter((b) => b.enabled !== false).map((b) => (b.provider || b.name || "").toLowerCase()));
+    const enabledCompanies = new Set((portals.tracked_companies || []).filter((c) => c.enabled !== false).map((c) => (c.name || "").toLowerCase()));
+    catalog.enabledBoards = catalog.remoteBoards.filter((b) => enabledBoards.has(b.id)).map((b) => b.id);
+    catalog.enabledCompanies = catalog.companies.filter((c) => enabledCompanies.has(c.name.toLowerCase())).map((c) => c.name);
+    // any tracked companies in portals.yml not in our catalog (e.g. career-ops defaults)
+    const known = new Set(catalog.companies.map((c) => c.name.toLowerCase()));
+    catalog.otherEnabledCompanies = (portals.tracked_companies || [])
+      .filter((c) => c.enabled !== false && !known.has((c.name || "").toLowerCase()))
+      .map((c) => c.name);
+    ok(res, catalog);
+  },
+
+  "POST /api/boards": async (req, res) => {
+    if (!yaml) return fail(res, "js-yaml unavailable", 500);
+    const { boards = [], companies = [] } = await body(req);
+    const catalog = JSON.parse(readFileSync(join(STUDIO, "data", "boards.json"), "utf8"));
+    ensurePortals();
+    const portals = loadYaml(P.portals) || {};
+
+    // Remote aggregator boards → job_boards[] entries
+    const boardSet = new Set(boards.map((b) => b.toLowerCase()));
+    const existingBoards = (portals.job_boards || []).filter((b) => !catalog.remoteBoards.some((rb) => rb.id === (b.provider || b.name || "").toLowerCase()));
+    portals.job_boards = [
+      ...existingBoards,
+      ...catalog.remoteBoards.filter((rb) => boardSet.has(rb.id)).map((rb) => ({ name: rb.name, provider: rb.id, enabled: true })),
+    ];
+
+    // Direct-company boards → tracked_companies[] with the right ATS api URL
+    const apiFor = (c) => ({
+      greenhouse: `https://boards-api.greenhouse.io/v1/boards/${c.slug}/jobs`,
+      lever: `https://api.lever.co/v0/postings/${c.slug}`,
+      ashby: `https://api.ashbyhq.com/posting-api/job-board/${c.slug}`,
+    }[c.provider] || "");
+    const compSet = new Set(companies.map((x) => x.toLowerCase()));
+    const chosenCatalog = catalog.companies.filter((c) => compSet.has(c.name.toLowerCase()));
+    // keep any tracked companies the user already had that aren't in our catalog
+    const known = new Set(catalog.companies.map((c) => c.name.toLowerCase()));
+    const kept = (portals.tracked_companies || []).filter((c) => !known.has((c.name || "").toLowerCase()));
+    portals.tracked_companies = [
+      ...kept,
+      ...chosenCatalog.map((c) => ({ name: c.name, careers_url: `https://jobs.${c.provider === "greenhouse" ? "greenhouse.io" : c.provider + ".co"}/${c.slug}`, provider: c.provider, api: apiFor(c), enabled: true })),
+    ];
+    writeFileSync(P.portals, yaml.dump(portals, { lineWidth: 120 }));
+    ok(res, { saved: true, boards: boards.length, companies: chosenCatalog.length });
   },
 
   "GET /api/resume": async (req, res) => ok(res, { content: read(P.cv) || "" }),
@@ -1312,6 +1473,21 @@ RULES:
     const profile = loadYaml(P.profile);
     ok(res, { candidate: scrubCandidate(profile?.candidate), roles: profile?.target_roles?.primary || [] });
   },
+
+  // Background evaluation queue. Evaluates pending inbox postings one at a
+  // time (local models are serial anyway); for score ≥ threshold it auto-runs
+  // the full prep pipeline (tailor PDF + cover letter). Poll /api/background.
+  "POST /api/background": async (req, res) => {
+    const { action, threshold = 4, limit = 20 } = await body(req);
+    if (action === "stop") { bg.stop = true; return ok(res, { state: bgState() }); }
+    if (action === "start") {
+      if (bg.running) return ok(res, { state: bgState() });
+      runBackground({ threshold, limit }).catch((e) => { bg.error = e.message; bg.running = false; });
+      return ok(res, { state: bgState() });
+    }
+    ok(res, { state: bgState() });
+  },
+  "GET /api/background": async (req, res) => ok(res, { state: bgState() }),
 
   "POST /api/scan": async (req, res) => {
     ensurePortals();
