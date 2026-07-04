@@ -1438,20 +1438,84 @@ $$("[data-overlay]").forEach((b) => b.addEventListener("click", async () => {
 $("#overlay-close").addEventListener("click", () => ($("#overlay").hidden = true));
 $("#overlay").addEventListener("click", (e) => { if (e.target.id === "overlay") $("#overlay").hidden = true; });
 
-/* ── Ask Job Studio (global assistant) ─────────────────── */
+/* ── Ask Job Studio — the action-capable assistant ───────
+ * Chat is the command surface; the main window is the canvas. When the
+ * assistant emits an action, we run it against the existing endpoints and
+ * render the artifact (résumé draft, etc.) in a canvas overlay — never as a
+ * wall of text in the chat. Destructive actions confirm first.
+ */
 const askMsgs = [];
+function activeJobWs() {
+  const job = state.jobs?.find?.((j) => j.id === state.activeJob);
+  return job ? { job, w: (state.ws?.[job.id]) } : null;
+}
+function agentContext() {
+  const aj = activeJobWs();
+  return {
+    view: STAGES[state.stage]?.label || "?",
+    job: aj?.w ? { company: aj.w.company, role: aj.w.role, hasJd: (aj.w.jd || "").length > 80 } : null,
+  };
+}
+
+// Render a produced artifact in a canvas overlay with a primary action.
+function showCanvas(title, bodyMd, primary) {
+  $("#overlay").hidden = false;
+  $("#overlay-body").innerHTML = `
+    <div class="row" style="margin-bottom:10px"><div class="page-title" style="font-size:20px;margin:0;flex:1">${esc(title)}</div>
+      ${primary ? `<button class="btn primary" id="canvas-primary">${esc(primary.label)}</button>` : ""}</div>
+    <div class="prose" style="max-height:64vh;overflow:auto">${md(bodyMd)}</div>`;
+  if (primary) $("#canvas-primary").addEventListener("click", async () => { await primary.onClick(); });
+}
+
+// Execute one agent action. Returns a short status string for the chat.
+async function runAgentAction(action) {
+  const a = action.args || {};
+  const aj = activeJobWs();
+  const needJob = () => { if (!aj?.w) { toast("Open a job first", true); throw new Error("no job open"); } return aj; };
+  switch (action.name) {
+    case "navigate": {
+      const map = { cockpit: 6, apply: 6, track: 7, discover: 5, resume: 2, roles: 4, model: 1 };
+      const i = map[a.view]; if (i != null) go(i);
+      return `Opened ${a.view}.`;
+    }
+    case "regenerateResume": {
+      const r = await api("/api/regenerate-resume", { method: "POST", body: { instruction: a.instruction || "improve overall" } });
+      showCanvas("Revised résumé — review before saving", r.draft, {
+        label: "Save to cv.md",
+        onClick: async () => {
+          if (!confirm("Replace your master résumé (cv.md) with this version?")) return;
+          await api("/api/resume", { method: "POST", body: { content: r.draft } });
+          currentCvCache = r.draft; $("#overlay").hidden = true; toast("Saved to cv.md");
+        },
+      });
+      return "Drafted a revised résumé — it's open for your review.";
+    }
+    case "tailorResume": {
+      const { w } = needJob();
+      const r = await api("/api/resume-chat", { method: "POST", body: { messages: [{ role: "user", content: a.instruction || "tailor to this job" }], jd: w.jd, company: w.company, role: w.role } });
+      if (r.draft) { w.improveDraft = r.draft; showCanvas(`Résumé tailored for ${w.company}`, r.draft, { label: "Use for this job", onClick: async () => { $("#overlay").hidden = true; w.improveOpen = true; renderWorkspace(); toast("Loaded into the job's résumé"); } }); }
+      return r.draft ? "Tailored the résumé for this job — review it." : r.reply;
+    }
+    case "evaluate": { const { job, w } = needJob(); w.report = null; w.running = false; runPipeline(job, w); return "Evaluating this job…"; }
+    case "generatePdf": { const { w } = needJob(); const context = [w.report && `FIT:\n${w.report}`].filter(Boolean).join("\n\n"); const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } }); w.pdf = r.pdf; renderWorkspace(); return `Generated ${r.pdf}.`; }
+    case "draftCover": { const { w } = needJob(); const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; renderWorkspace(); return "Drafted the cover letter."; }
+    case "markApplied": { const { job, w } = needJob(); await trackJob(job, w, "Applied"); return "Marked applied."; }
+    case "addCompany": { if (!a.url) return "Give me the careers URL."; const r = await api("/api/add-company", { method: "POST", body: { url: a.url } }); return `Added ${r.name} (${r.provider}).`; }
+    case "scanNow": { toast("Scanning…"); const r = await api("/api/scan", { method: "POST", body: {} }); state.status = null; return `Scan done — ${r.pipeline.length} in inbox.`; }
+    case "backgroundEval": { await api("/api/background", { method: "POST", body: { action: "start", threshold: 4, limit: 20 } }); return "Background evaluation started."; }
+    default: return "";
+  }
+}
+
 function initAsk() {
   const fab = $("#ask-fab"), panel = $("#ask-panel"), log = $("#ask-log"), input = $("#ask-in");
   const paint = (pending) => {
-    log.innerHTML = askMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("")
-      + (pending ? `<div class="msg assistant">${spin}</div>` : "")
-      || `<div class="empty" style="padding:14px">Hi — I know your résumé, your targets, and what you've applied to. Ask me about a role, the job market, or what to do next.</div>`;
+    log.innerHTML = (askMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("")
+      + (pending ? `<div class="msg assistant">${spin}</div>` : ""))
+      || `<div class="empty" style="padding:14px">Hi — I know your résumé, targets, and applications. Ask me anything, or tell me to <i>do</i> something: “make my résumé lead with GenAI”, “evaluate this job”, “add stripe's careers board”.</div>`;
     log.scrollTop = log.scrollHeight;
   };
-  const toggle = (on) => {
-    panel.hidden = on === undefined ? !panel.hidden : !on;
-    if (!panel.hidden) { paint(false); input.focus(); }
-  };
+  const toggle = (on) => { panel.hidden = on === undefined ? !panel.hidden : !on; if (!panel.hidden) { paint(false); input.focus(); } };
   fab.addEventListener("click", () => toggle());
   $("#ask-close").addEventListener("click", () => toggle(false));
   const send = async () => {
@@ -1461,9 +1525,13 @@ function initAsk() {
     askMsgs.push({ role: "user", content: text });
     paint(true);
     try {
-      const pageContext = `${STAGES[state.stage]?.label || ""} stage${state.activeJob ? "; a job is open in the apply workspace" : ""}`;
-      const r = await api("/api/ask", { method: "POST", body: { messages: askMsgs, pageContext } });
-      askMsgs.push({ role: "assistant", content: r.reply });
+      const r = await api("/api/agent", { method: "POST", body: { messages: askMsgs, context: agentContext() } });
+      let content = r.reply || "";
+      if (r.action?.name) {
+        try { const status = await runAgentAction(r.action); if (status && !content) content = status; }
+        catch (e) { content += `\n\n_(couldn't ${r.action.name}: ${e.message})_`; }
+      }
+      askMsgs.push({ role: "assistant", content: content || "Done." });
     } catch (e) { askMsgs.push({ role: "assistant", content: `⚠️ ${e.message}` }); }
     paint(false);
   };

@@ -550,6 +550,41 @@ async function fetchJdFromUrl(url) {
 // ---------------------------------------------------------------------------
 const escHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+// Tolerant action-envelope parser: small models mangle the closing (`}}`,
+// missing `>>`, extra whitespace). Find `<<act:NAME`, then brace-match the JSON
+// args if present, and strip the whole envelope (however it was closed) out of
+// the visible reply.
+const AGENT_ACTIONS = ["navigate", "regenerateResume", "tailorResume", "evaluate", "generatePdf", "draftCover", "markApplied", "addCompany", "scanNow", "backgroundEval"];
+function extractAction(reply) {
+  // Tolerate: `<<act:NAME …>>`, `<<NAME …>>` (dropped prefix), stray braces,
+  // missing `>>`. Gate on a known action name so a stray `<<` isn't an action.
+  const m = reply.match(new RegExp(`<<\\s*(?:act:)?\\s*(${AGENT_ACTIONS.join("|")})\\b`, "i"));
+  if (!m) return { action: null, clean: reply.trim() };
+  const name = AGENT_ACTIONS.find((a) => a.toLowerCase() === m[1].toLowerCase());
+  let i = m.index + m[0].length;
+  // find start of JSON
+  const braceStart = reply.indexOf("{", i);
+  let args = {}, end = i;
+  if (braceStart !== -1 && braceStart < (reply.indexOf("\n", i) === -1 ? reply.length : reply.indexOf("\n", i) + 200)) {
+    let depth = 0, j = braceStart, inStr = false, esc = false;
+    for (; j < reply.length; j++) {
+      const c = reply[j];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; }
+      else if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) { j++; break; } }
+    }
+    const jsonStr = reply.slice(braceStart, j);
+    try { args = JSON.parse(jsonStr); } catch { args = {}; }
+    end = j;
+  }
+  // consume trailing junk up to and including >> or end of line
+  let tail = reply.slice(end).match(/^[^\n]*?(>>|$)/);
+  const envEnd = end + (tail ? tail[0].length : 0);
+  const clean = (reply.slice(0, m.index) + reply.slice(envEnd)).replace(/\n{3,}/g, "\n\n").trim();
+  return { action: { name, args }, clean };
+}
+
 const TAILOR_JSON_PROMPT = `Produce the candidate's resume TAILORED to the job description, as STRICT JSON (no fences, no commentary):
 {
   "summary": "3-4 sentence professional summary weaving in the JD's top keywords where the resume genuinely supports them",
@@ -1109,6 +1144,78 @@ const routes = {
     } catch (e) { fail(res, e.message, 502); }
   },
 
+  // Regenerate the MASTER résumé per an instruction (no JD). Returns a full
+  // revised résumé draft the UI renders in the canvas; the user saves to cv.md.
+  "POST /api/regenerate-resume": async (req, res) => {
+    const { instruction } = await body(req);
+    if (!instruction || instruction.trim().length < 3) return fail(res, "instruction required");
+    try {
+      const ctx = groundingContext();
+      const raw = await chat(loadSettings(), [
+        { role: "system", content: `You are a résumé editor.\n\n${ctx}\n\n${GROUNDING_RULES}\n\nRewrite the candidate's résumé per the user's instruction. ONLY reorder, rephrase, re-emphasise, or restructure existing facts — never add employers, dates, metrics, or claims not already present. Keep it a complete résumé. Output ONLY the full résumé as markdown (no commentary, no code fence).` },
+        { role: "user", content: `Instruction: ${instruction}` },
+      ], { maxTokens: 4096 });
+      const draft = raw.replace(/^```(?:markdown|md)?\n?/, "").replace(/\n?```\s*$/, "").trim();
+      logEvent("regenerate_resume");
+      ok(res, { draft });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
+  // The action-capable assistant. Same knowledge as /api/ask, but it may emit
+  // ONE action envelope on its own line: <<act:ACTION {json}>>. The client
+  // parses it, runs the action against the existing endpoints, and renders the
+  // resulting artifact in the main window. Destructive actions confirm client-side.
+  "POST /api/agent": async (req, res) => {
+    const { messages, context } = await body(req);
+    if (!Array.isArray(messages) || !messages.length) return fail(res, "messages[] required");
+    try {
+      const profile = loadYaml(P.profile) || {};
+      const cv = (read(P.cv) || "").slice(0, 2500);
+      const roles = profile.target_roles?.primary || [];
+      const applied = parseTracker().filter((r) => ["Applied", "Responded", "Interview", "Offer"].includes(r.status));
+      const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+      let web = "";
+      if (/\b(latest|current|trend|market|202\d|salary|in demand|right now|news)\b/i.test(lastUser)) {
+        const r = await webSearch(lastUser.slice(0, 120)).catch(() => []);
+        web = r.slice(0, 4).map((x, i) => `[${i + 1}] ${x.title} — ${x.snippet} (${x.url})`).join("\n");
+      }
+      const jobOpen = context?.job ? `A JOB IS OPEN: ${context.job.role} @ ${context.job.company}${context.job.hasJd ? " (JD loaded)" : ""}.` : "No job is currently open.";
+
+      const SYSTEM = `You are "Job Studio" — the user's action-capable job-search co-pilot inside a LOCAL app. You both advise AND do things.
+
+WHAT YOU KNOW:
+RÉSUMÉ (excerpt):\n${cv}
+TARGET ROLES: ${roles.join(", ") || "not set"}
+INTERVIEW/PROFILE FACTS: ${JSON.stringify(profile.interview || {})}
+APPLIED (${applied.length}): ${applied.slice(0, 10).map((r) => `${r.role}@${r.company} [${r.status}]`).join("; ") || "none yet"}
+CONTEXT: ${jobOpen} Current view: ${context?.view || "?"}.${web ? `\nFRESH WEB:\n${web}` : ""}
+
+YOU CAN ACT by emitting EXACTLY ONE action on its own line (never inside a code fence). Format: <<act:ACTION {"key":"value"}>>
+Actions:
+- regenerateResume {"instruction":"…","scope":"master"} — rewrite the user's MASTER résumé per the instruction (reorder/rephrase only, never invent). Use scope "master" from the home view.
+- tailorResume {"instruction":"…"} — tailor the résumé to the OPEN job (only if a job is open).
+- evaluate {} — run the A–G fit evaluation on the open job.
+- generatePdf {} — render the tailored résumé PDF for the open job.
+- draftCover {} — draft the cover letter for the open job.
+- markApplied {} — mark the open job Applied (asks the user to confirm).
+- addCompany {"url":"https://…careers…"} — add a Greenhouse/Lever/Ashby company to the scan.
+- scanNow {} — run a portal scan now.
+- backgroundEval {} — start background evaluation + auto-prep of the inbox.
+- navigate {"view":"cockpit|apply|track|discover|resume"} — take the user somewhere.
+
+RULES:
+- Emit an action ONLY when the user is asking to DO something you have an action for. Otherwise just answer — no envelope.
+- Say briefly what you're doing, THEN the envelope on its own line. Don't paste résumé text in chat — the app renders artifacts in the window.
+- Never invent résumé facts. Never auto-submit an application. Prefer the open job's context for job-specific actions.
+- Keep replies short and concrete.`;
+
+      const reply = await chat(loadSettings(), [{ role: "system", content: SYSTEM }, ...messages.slice(-12)], { maxTokens: 900 });
+      const { action, clean } = extractAction(reply);
+      logEvent("agent", { action: action?.name || "none" });
+      ok(res, { reply: clean, action });
+    } catch (e) { fail(res, e.message, 502); }
+  },
+
   // Inline résumé-improvement chat (apply screen). The model proposes an
   // improved résumé for the current JD; when it emits a full markdown résumé
   // in a ```markdown fence, the UI shows it in the live preview to accept.
@@ -1246,6 +1353,43 @@ RULES:
 
   // Per-job artifact bundle — the apply flow reads this on open (resume where
   // left off) and writes each artifact as it's produced.
+  // Cockpit feed: what needs the user's attention, ranked. Combines the
+  // per-job artifact store (evaluated/prepared) with the tracker (applied,
+  // follow-ups due, interviews upcoming). No model calls — pure aggregation.
+  "GET /api/cockpit": async (req, res) => {
+    const store = loadJobs();
+    const rows = parseTracker();
+    const trackedByKey = {};
+    for (const r of rows) trackedByKey[`${r.company.toLowerCase()}|${r.role.toLowerCase()}`] = r;
+
+    // "To review": evaluated + (ideally) prepared, not yet applied/skipped.
+    const appliedKeys = new Set(rows.filter((r) => ["Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"].includes(r.status)).map((r) => `${r.company.toLowerCase()}|${r.role.toLowerCase()}`));
+    const review = [];
+    for (const [key, j] of Object.entries(store)) {
+      if (j.score == null) continue;
+      const ck = `${(j.company || "").toLowerCase()}|${(j.role || "").toLowerCase()}`;
+      if (appliedKeys.has(ck)) continue;
+      review.push({ key, company: j.company, role: j.role, url: /^https?:/.test(key) ? key : null, score: j.score, prepared: !!(j.pdf && j.letter), pdf: j.pdf || null });
+    }
+    review.sort((a, b) => (b.prepared - a.prepared) || (b.score - a.score));
+
+    // Applied → monitor follow-ups; Interview → upcoming.
+    const days = (d) => Math.max(0, Math.round((Date.now() - new Date(d)) / 86400000));
+    const applied = rows.filter((r) => r.status === "Applied").map((r) => ({ ...r, daysSince: days(r.date), followUpDue: days(r.date) >= 7 }));
+    const interviewing = rows.filter((r) => r.status === "Interview" || r.status === "Responded").map((r) => {
+      const j = store[`${r.company.toLowerCase()}|${r.role.toLowerCase()}`] || {};
+      return { ...r, interviewDate: j.interviewDate || "", roadmapFile: j.roadmapFile || "", daysToInterview: j.interviewDate ? Math.round((new Date(j.interviewDate) - Date.now()) / 86400000) : null };
+    });
+
+    ok(res, {
+      review: review.slice(0, 40),
+      counts: { review: review.length, reviewPrepared: review.filter((r) => r.prepared).length, applied: applied.length, followUpsDue: applied.filter((a) => a.followUpDue).length, interviewing: interviewing.length },
+      applied, interviewing,
+      background: bgState(),
+      schedule: schedulerState(),
+    });
+  },
+
   "GET /api/job-state": async (req, res, url) => {
     ok(res, { state: loadJobs()[jobKey({ url: url.searchParams.get("url"), company: url.searchParams.get("company"), role: url.searchParams.get("role") })] || null });
   },
