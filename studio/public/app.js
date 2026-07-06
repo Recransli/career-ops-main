@@ -78,6 +78,51 @@ function md(src) {
 }
 
 const copyText = (t, label = "Copied") => navigator.clipboard.writeText(t).then(() => toast(label));
+
+// Debounced place autocomplete: attaches a suggestion dropdown to an input so
+// locations are ALWAYS chosen from real places, never typed free-form.
+// onPick(place) fires on selection. If chips=true, the input clears after each
+// pick (multi-select); otherwise the label stays in the box (single-select).
+function attachPlaces(input, dropdown, { onPick, chips = false } = {}) {
+  let timer, active = -1, current = [];
+  const close = () => { dropdown.hidden = true; active = -1; };
+  const paint = () => {
+    dropdown.innerHTML = current.length
+      ? current.map((p, i) => `<div class="addr-opt ${i === active ? "hi" : ""}" data-i="${i}">${esc(p.label)}</div>`).join("")
+      : `<div class="addr-opt" style="color:var(--faint)">no matches — keep typing</div>`;
+    dropdown.hidden = false;
+    $$(".addr-opt[data-i]", dropdown).forEach((el) => el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      pick(current[+el.dataset.i]);
+    }));
+  };
+  const pick = (p) => {
+    onPick(p);
+    if (chips) input.value = ""; else input.value = p.label;
+    close();
+  };
+  input.setAttribute("autocomplete", "off");
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) return close();
+    timer = setTimeout(async () => {
+      try {
+        const { places } = await api(`/api/places?q=${encodeURIComponent(q)}`);
+        current = places;
+        paint();
+      } catch { close(); }
+    }, 280);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (dropdown.hidden) return;
+    if (e.key === "ArrowDown") { active = Math.min(active + 1, current.length - 1); paint(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { active = Math.max(active - 1, 0); paint(); e.preventDefault(); }
+    else if (e.key === "Enter" && active >= 0) { pick(current[active]); e.preventDefault(); }
+    else if (e.key === "Escape") close();
+  });
+  input.addEventListener("blur", () => setTimeout(close, 200));
+}
 const markAdds = (t) => esc(t).replace(/\[ADD:([^\]]*)\]/g, "<mark>[ADD:$1]</mark>");
 const spin = `<span class="spinner"></span>`;
 
@@ -99,24 +144,39 @@ const STAGES = [
   { id: "roles", label: "Roles" },
   { id: "scan", label: "Discover" },
   { id: "board", label: "Apply" },
+  { id: "track", label: "Track" },
+  { id: "cockpit", label: "Home" },
 ];
+const IDX = Object.fromEntries(STAGES.map((s, i) => [s.id, i]));
+const SETUP_STAGES = [1, 2, 3, 4, 5]; // model→discover
+const setupComplete = () => state.setup?.model && state.setup?.cv && state.setup?.roles;
 
 function renderRail() {
-  $("#journey-rail").innerHTML = STAGES.map((s, i) => `
-    <div class="j-step ${i < state.stage ? "done" : ""} ${i === state.stage ? "active" : ""}">
-      <span class="j-dot" data-stage="${i}" title="${s.label}">${i < state.stage ? "✓" : i + 1}<span class="j-label">${s.label}</span></span>
-      ${i < STAGES.length - 1 ? `<span class="j-line"></span>` : ""}
-    </div>`).join("");
+  const rail = $("#journey-rail");
+  // Post-setup: a compact cockpit nav. During onboarding: the journey dots.
+  if (setupComplete() && !SETUP_STAGES.includes(state.stage) && state.stage !== IDX.welcome) {
+    const nav = [["cockpit", "Home"], ["board", "Apply"], ["track", "Track"]];
+    rail.innerHTML = `<div class="cockpit-nav">
+      ${nav.map(([id, l]) => `<button class="cnav ${state.stage === IDX[id] ? "active" : ""}" data-stage="${IDX[id]}">${l}</button>`).join("")}
+      <button class="cnav gear" data-stage="${IDX.model}" title="Setup & settings">⚙</button>
+    </div>`;
+  } else {
+    rail.innerHTML = STAGES.slice(0, 8).map((s, i) => `
+      <div class="j-step ${i < state.stage ? "done" : ""} ${i === state.stage ? "active" : ""}">
+        <span class="j-dot" data-stage="${i}" title="${s.label}">${i < state.stage ? "✓" : i + 1}<span class="j-label">${s.label}</span></span>
+        ${i < 7 ? `<span class="j-line"></span>` : ""}
+      </div>`).join("");
+  }
   $$("#journey-rail [data-stage]").forEach((d) => d.addEventListener("click", () => {
     const i = +d.dataset.stage;
-    if (i <= state.maxStage) go(i);
+    if (setupComplete() || i <= state.maxStage) go(i);
   }));
 }
 
 async function go(i) {
   state.stage = i;
   state.maxStage = Math.max(state.maxStage, i);
-  bg().setStage(i);
+  bg().setStage(Math.min(i, 7));
   bg().setGlobe(STAGES[i].id === "interview");
   renderRail();
   view.innerHTML = `<div class="empty">${spin}</div>`;
@@ -390,14 +450,34 @@ stages.resume = async () => {
 };
 
 /* 3 — Interview (the "you" stage — location-aware) */
+const PNTS = "Prefer not to say";
 const IV_FIELDS = [
-  { k: "home_location", label: "Where are you based?", ph: "e.g. Hyderabad, India", globe: true },
-  { k: "target_locations", label: "Where would you work? (comma-separated cities/countries)", ph: "e.g. Bangalore, Remote, London, USA", globe: true },
-  { k: "remote_preference", label: "Work style", type: "select", opts: ["Remote only", "Remote preferred, hybrid OK", "Hybrid", "Onsite OK", "Anything"] },
-  { k: "work_authorization", label: "Where are you authorized to work?", ph: "e.g. India citizen; US H-1B transfer needed" },
-  { k: "needs_sponsorship", label: "Would you need visa sponsorship abroad?", type: "select", opts: ["No", "Yes", "Depends on country"] },
-  { k: "salary_expectation", label: "Salary expectation (range + currency)", ph: "e.g. ₹45–60 LPA / $140–170k" },
-  { k: "notice_period", label: "Notice period / start date", ph: "e.g. 30 days" },
+  { section: "Location & eligibility" },
+  { k: "home_location", label: "Where are you based?", ph: "Type a city — pick from the list", globe: true, place: true },
+  { k: "target_locations", label: "Where would you work? (pick as many as you like)", ph: "Type a city or “Remote” — pick to add", globe: true, places: true, wide: true },
+  { k: "address_search", label: "Street address — start typing, pick a suggestion", ph: "e.g. 554 Washington Blvd…", wide: true, addr: true },
+  { k: "address_line1", label: "Address line 1" },
+  { k: "address_city", label: "City" },
+  { k: "address_state", label: "State / region" },
+  { k: "address_postcode", label: "ZIP / postal code" },
+  { k: "address_country", label: "Country" },
+  { k: "work_authorization", label: "Where are you authorized to work? (status too)", ph: "e.g. US — F1 CPT; India citizen" },
+  { k: "needs_sponsorship", label: "Will you need visa sponsorship now or in future?", type: "select", opts: ["", "No", "Yes", "Depends on country"] },
+  { k: "over_18", label: "Are you 18 or older?", type: "select", opts: ["", "Yes", "No"] },
+  { section: "Logistics & compensation" },
+  { k: "remote_preference", label: "Work style", type: "select", opts: ["", "Remote only", "Remote preferred, hybrid OK", "Hybrid", "Onsite OK", "Anything"] },
+  { k: "relocation", label: "Willing to relocate?", type: "select", opts: ["", "Yes", "No", "For the right role"] },
+  { k: "salary_expectation", label: "Salary expectation (range + currency)", ph: "e.g. $140–170k" },
+  { k: "notice_period", label: "Notice period / start date", ph: "e.g. 2 weeks" },
+  { k: "security_clearance", label: "Security clearance (if any)", ph: "e.g. none / Secret" },
+  { k: "preferred_name", label: "Preferred name (if different)", ph: "" },
+  { section: "Self-identification — optional. Used ONLY to pre-fill the EEO sections you'd fill anyway; “Prefer not to say” is always fine." },
+  { k: "gender", label: "Gender", type: "select", opts: ["", PNTS, "Male", "Female", "Non-binary"] },
+  { k: "race_ethnicity", label: "Race / ethnicity", type: "select", opts: ["", PNTS, "Asian", "Black or African American", "Hispanic or Latino", "White", "American Indian or Alaska Native", "Native Hawaiian or Other Pacific Islander", "Two or more races"] },
+  { k: "veteran_status", label: "Veteran status (US)", type: "select", opts: ["", PNTS, "I am not a protected veteran", "I identify as one or more of the classifications of a protected veteran"] },
+  { k: "disability_status", label: "Disability status", type: "select", opts: ["", PNTS, "No, I do not have a disability", "Yes, I have a disability (or previously had one)"] },
+  { k: "pronouns", label: "Pronouns", ph: "e.g. he/him" },
+  { section: "Your story" },
   { k: "superpower", label: "What sets you apart? Your professional superpower", ph: "The thing colleagues come to you for", wide: true },
   { k: "achievement_story", label: "Your proudest achievement — the story you'd lead with in an interview", ph: "Situation, what you did, the measurable result", wide: true, area: true },
   { k: "why_looking", label: "Why are you looking right now?", ph: "Your honest exit story — we'll phrase it well", wide: true },
@@ -407,22 +487,51 @@ const IV_FIELDS = [
 stages.interview = async () => {
   const { answers } = await api("/api/interview");
   state.interview = answers || {};
+  state.chatMsgs ||= [];
+  const joinVal = (v) => (Array.isArray(v) ? v.join(", ") : v || "");
+
+  const fieldHtml = (f) => {
+    if (f.section) return `<div style="grid-column:1/-1;margin-top:10px"><h3 style="font-size:14.5px">${esc(f.section)}</h3></div>`;
+    const val = joinVal(state.interview[f.k]);
+    const relative = f.addr || f.place || f.places;
+    let control;
+    if (f.type === "select") {
+      control = `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${val === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    } else if (f.places) {
+      control = `<div id="chips-${f.k}" class="loc-chips"></div>
+        <input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" autocomplete="off">
+        <div class="addr-suggest" id="sug-${f.k}" hidden></div>`;
+    } else if (f.place) {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(val)}" autocomplete="off">
+        <div class="addr-suggest" id="sug-${f.k}" hidden></div>`;
+    } else if (f.area) {
+      control = `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(val)}</textarea>`;
+    } else if (f.addr) {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="" autocomplete="off"><div class="addr-suggest" id="addr-suggest" hidden></div>`;
+    } else {
+      control = `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(val)}" autocomplete="off">`;
+    }
+    return `<div style="${f.wide ? "grid-column:1/-1;" : ""}${relative ? "position:relative;" : ""}">
+        <label class="field">${esc(f.label)}</label>${control}</div>`;
+  };
+
   view.innerHTML = `
     <div class="stage stage-narrow">
       <div class="page-title">About you</div>
-      <p class="page-sub">Application forms ask the same things over and over — authorization, salary, notice, your story. Answer once here and every drafted application pulls from it. Locations you add appear on the globe and focus the job scan.</p>
+      <p class="page-sub">Application forms ask the same things over and over — authorization, salary, EEO questions, your story. Answer once, here, and every drafted application pulls from it. Talk it through in chat, or fill the form directly — they stay in sync.</p>
+
       <div class="card">
-        <div class="iv-grid">
-          ${IV_FIELDS.map((f) => `
-            <div style="${f.wide ? "grid-column:1/-1" : ""}">
-              <label class="field">${f.label}</label>
-              ${f.type === "select"
-                ? `<select id="iv-${f.k}">${f.opts.map((o) => `<option ${state.interview[f.k] === o ? "selected" : ""}>${o}</option>`).join("")}</select>`
-                : f.area
-                  ? `<textarea id="iv-${f.k}" style="min-height:90px;font-family:var(--sans);font-size:14px" placeholder="${esc(f.ph || "")}">${esc(joinVal(state.interview[f.k]))}</textarea>`
-                  : `<input type="text" id="iv-${f.k}" placeholder="${esc(f.ph || "")}" value="${esc(joinVal(state.interview[f.k]))}">`}
-            </div>`).join("")}
+        <h3>Interview chat</h3>
+        <p class="hint">The companion asks what forms for <i>your</i> target roles actually ask — it reads real postings from your scan to know. Every fact you give is saved into the form below.</p>
+        <div id="chat-log" class="chat-log">${state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("") || `<div class="empty">Say hi, or ask “what do you need from me?”</div>`}</div>
+        <div class="row" style="margin-top:8px">
+          <input type="text" id="chat-in" placeholder="Type a message…" style="flex:1">
+          <button class="btn primary" id="chat-send">Send</button>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="iv-grid">${IV_FIELDS.map(fieldHtml).join("")}</div>
         <div class="row end" style="margin-top:16px">
           <span class="hint" style="margin-right:auto">Saved to your profile — user-layer, survives updates.</span>
           <button class="btn primary" id="iv-save">Save answers</button>
@@ -431,23 +540,102 @@ stages.interview = async () => {
       ${stageNav({ backTo: 2, onNext: true })}
     </div>`;
 
-  function joinVal(v) { return Array.isArray(v) ? v.join(", ") : v || ""; }
-  const updateGlobe = () => bg().setCities([$("#iv-home_location").value, ...$("#iv-target_locations").value.split(",")].map((x) => x.trim()).filter(Boolean));
-  ["home_location", "target_locations"].forEach((k) => $(`#iv-${k}`).addEventListener("input", updateGlobe));
+  // Target locations = chips, chosen only from real places.
+  let targetLocs = Array.isArray(state.interview.target_locations) ? [...state.interview.target_locations] : [];
+  const updateGlobe = () => bg().setCities([$("#iv-home_location").value, ...targetLocs].map((x) => x.trim()).filter(Boolean));
+  const paintChips = () => {
+    $("#chips-target_locations").innerHTML = targetLocs.map((l, i) => `<span class="chip">${esc(l)} <button data-i="${i}">×</button></span>`).join("");
+    $$("#chips-target_locations [data-i]").forEach((b) => b.addEventListener("click", () => { targetLocs.splice(+b.dataset.i, 1); paintChips(); updateGlobe(); }));
+  };
+  paintChips();
+  attachPlaces($("#iv-home_location"), $("#sug-home_location"), { onPick: (p) => { updateGlobe(); } });
+  attachPlaces($("#iv-target_locations"), $("#sug-target_locations"), {
+    chips: true,
+    onPick: (p) => { if (!targetLocs.includes(p.label)) { targetLocs.push(p.label); paintChips(); updateGlobe(); } },
+  });
   updateGlobe();
+
+  // ── Address autocomplete (keyless geocoder via the local server) ──
+  const addrIn = $("#iv-address_search");
+  const sug = $("#addr-suggest");
+  let addrTimer;
+  addrIn.addEventListener("input", () => {
+    clearTimeout(addrTimer);
+    const q = addrIn.value.trim();
+    if (q.length < 3) { sug.hidden = true; return; }
+    addrTimer = setTimeout(async () => {
+      try {
+        const { suggestions } = await api(`/api/geocode?q=${encodeURIComponent(q)}`);
+        sug.innerHTML = suggestions.length
+          ? suggestions.map((s, i) => `<div class="addr-opt" data-i="${i}">${esc(s.label)}</div>`).join("")
+          : `<div class="addr-opt" style="color:var(--faint)">no matches — keep typing or fill manually</div>`;
+        sug.hidden = false;
+        $$(".addr-opt[data-i]", sug).forEach((el) => el.addEventListener("mousedown", () => {
+          const s = suggestions[+el.dataset.i];
+          $("#iv-address_line1").value = s.line1;
+          $("#iv-address_city").value = s.city;
+          $("#iv-address_state").value = s.state;
+          $("#iv-address_postcode").value = s.postcode;
+          $("#iv-address_country").value = s.country;
+          addrIn.value = s.label;
+          sug.hidden = true;
+          toast("Address components filled — check the ZIP");
+        }));
+      } catch { sug.hidden = true; }
+    }, 350);
+  });
+  addrIn.addEventListener("blur", () => setTimeout(() => (sug.hidden = true), 250));
 
   const collect = () => {
     const a = {};
     for (const f of IV_FIELDS) {
-      const v = $(`#iv-${f.k}`).value.trim();
-      a[f.k] = f.k === "target_locations" ? v.split(",").map((x) => x.trim()).filter(Boolean) : v;
+      if (f.section || f.addr || f.places) continue;
+      a[f.k] = $(`#iv-${f.k}`).value.trim();
     }
+    a.target_locations = targetLocs;
     return a;
   };
+  const refreshFromSaved = async () => {
+    const { answers: a2 } = await api("/api/interview");
+    state.interview = a2 || {};
+    for (const f of IV_FIELDS) {
+      if (f.section || f.addr || f.places) continue;
+      const el = $(`#iv-${f.k}`);
+      const v = joinVal(state.interview[f.k]);
+      if (v && el.value !== v) el.value = v;
+    }
+    if (Array.isArray(state.interview.target_locations)) { targetLocs = [...state.interview.target_locations]; paintChips(); }
+    updateGlobe();
+  };
+
+  // ── Chat ──
+  const sendChat = async () => {
+    const text = $("#chat-in").value.trim();
+    if (!text) return;
+    $("#chat-in").value = "";
+    state.chatMsgs.push({ role: "user", content: text });
+    const log = $("#chat-log");
+    log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
+    log.scrollTop = log.scrollHeight;
+    try {
+      const r = await api("/api/interview-chat", { method: "POST", body: { messages: state.chatMsgs } });
+      state.chatMsgs.push({ role: "assistant", content: r.reply });
+      log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("");
+      log.scrollTop = log.scrollHeight;
+      if (r.saved?.length) { await refreshFromSaved(); toast(`Saved: ${r.saved.join(", ")}`); }
+    } catch (e) {
+      state.chatMsgs.pop();
+      toast(e.message, true);
+      log.innerHTML = state.chatMsgs.map((m) => `<div class="msg ${m.role}">${md(esc(m.content))}</div>`).join("");
+    }
+  };
+  $("#chat-send").addEventListener("click", sendChat);
+  $("#chat-in").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
   $("#iv-save").addEventListener("click", async () => {
     try {
       await api("/api/interview", { method: "POST", body: { answers: collect() } });
-      toast("Saved — the scanner is now location-aware too");
+      toast("Saved — the scanner and form-fill now know all of this");
     } catch (e) { toast(e.message, true); }
   });
   wireNav(2, async () => {
@@ -511,21 +699,102 @@ stages.roles = async () => {
 /* 5 — Scan / Discover */
 stages.scan = async () => {
   const s = await loadStatus();
+  const boards = await api("/api/boards");
+  const chosen = { boards: new Set(boards.enabledBoards), companies: new Set(boards.enabledCompanies) };
+  let boardFilter = "";
   view.innerHTML = `
     <div class="stage stage-narrow">
       <div class="page-title">Discover openings</div>
-      <p class="page-sub">Studio queries 40+ job-board APIs directly (Greenhouse, Lever, Ashby…) with your keywords and locations — no AI tokens spent, nothing sent anywhere. New matches land in your inbox.</p>
-      <div class="card" style="text-align:center;padding:34px">
-        <div style="font-family:var(--serif);font-size:40px;font-weight:700">${s.pipeline}</div>
-        <p class="hint">postings currently in your inbox</p>
-        <button class="btn primary" id="scan-btn" style="margin-top:8px">Scan portals now</button>
-        <div id="scan-out" style="text-align:left;margin-top:14px"></div>
+      <p class="page-sub">Pick which boards and companies to scan, then Studio queries their public APIs directly with your role keywords and locations — no AI tokens, nothing sent anywhere. Precise keywords (from your target roles) keep false positives down.</p>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Remote & aggregator boards</h3><span class="hint" id="board-count"></span></div>
+        <div class="board-grid" id="remote-boards">
+          ${boards.remoteBoards.map((b) => `
+            <label class="board-opt"><input type="checkbox" data-board="${esc(b.id)}" ${chosen.boards.has(b.id) ? "checked" : ""}>
+            <span><b>${esc(b.name)}</b><br><span class="hint">${esc(b.desc)}</span></span></label>`).join("")}
+        </div>
       </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Direct company career sites</h3>
+          <button class="btn small" id="co-all">Select all</button><button class="btn small" id="co-none">Clear</button></div>
+        <input type="text" id="co-filter" placeholder="Filter ${boards.companies.length} companies — name or tag (ai, fintech, remote…)" style="margin-bottom:8px">
+        <div class="board-grid" id="company-list"></div>
+        ${boards.otherEnabledCompanies?.length ? `<p class="hint" style="margin-top:8px">Plus ${boards.otherEnabledCompanies.length} companies already in your portals.yml (kept as-is).</p>` : ""}
+        <details style="margin-top:12px"><summary class="hint" style="cursor:pointer">+ Add a company not in the list</summary>
+          <div class="row" style="margin-top:8px">
+            <input type="text" id="add-url" placeholder="Paste a Greenhouse / Lever / Ashby careers URL" style="flex:2;min-width:220px">
+            <input type="text" id="add-name" placeholder="Display name (optional)" style="flex:1;min-width:120px">
+            <button class="btn" id="add-co-btn">Add & include</button>
+          </div>
+          <p class="hint" style="margin-top:6px">e.g. <code>https://job-boards.greenhouse.io/yourcompany</code> — Studio detects the ATS, verifies it responds, and adds it to your scan.</p>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">${s.pipeline} in your inbox</h3>
+          <button class="btn" id="save-boards">Save selection</button>
+          <button class="btn primary" id="scan-btn">Scan now</button></div>
+        <div id="scan-out" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Background evaluation</h3>
+          <span class="hint" id="bg-status"></span></div>
+        <p class="hint">Let Studio evaluate your inbox in the background and auto-prepare everything (tailored PDF + cover letter) for strong matches — so when you sit down, high-fit jobs are ready.</p>
+        <div class="row">
+          <label class="hint" style="margin:0">Auto-prepare at ≥ <select id="bg-threshold" style="width:auto;padding:4px 8px"><option>4</option><option>4.5</option><option>3.5</option></select> /5</label>
+          <label class="hint" style="margin:0">Up to <input type="number" id="bg-limit" value="15" min="1" max="100" style="width:70px;padding:4px 8px"> jobs</label>
+          <button class="btn primary" id="bg-start">Start</button>
+          <button class="btn" id="bg-stop">Stop</button>
+        </div>
+        <div id="bg-progress" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Daily refresh</h3><span class="hint" id="sched-next"></span></div>
+        <p class="hint">Keep your inventory current — Studio re-scans your boards automatically every day at a set time. (Runs while Studio is open; for always-on, install the Mac agent below.)</p>
+        <div class="row">
+          <label class="hint" style="margin:0"><input type="checkbox" id="sched-on" style="width:auto"> Auto-scan daily at
+            <select id="sched-hour" style="width:auto;padding:4px 8px">${Array.from({ length: 24 }, (_, h) => `<option value="${h}">${String(h).padStart(2, "0")}:00</option>`).join("")}</select></label>
+          <label class="hint" style="margin:0"><input type="checkbox" id="sched-eval" style="width:auto"> then evaluate new jobs</label>
+          <button class="btn" id="sched-save">Save</button>
+          <button class="btn" id="sched-now">Run now</button>
+        </div>
+        <div class="note" style="margin-top:10px"><b>Always-on (macOS):</b> to update daily even when Studio isn't open, run <code>bash studio/mac/install.sh</code> once — it installs a launchd agent that keeps Studio running and lets the daily refresh fire on schedule. Remove with <code>--remove</code>.</div>
+        <div id="sched-out"></div>
+      </div>
+
       ${stageNav({ backTo: 4, onNext: true, nextLabel: "To the applications →" })}
     </div>`;
+
+  // company list (filterable)
+  const renderCompanies = () => {
+    const f = boardFilter.toLowerCase();
+    const list = boards.companies.filter((c) => !f || c.name.toLowerCase().includes(f) || (c.tags || []).some((t) => t.includes(f)) || c.provider.includes(f));
+    $("#company-list").innerHTML = list.map((c) => `
+      <label class="board-opt"><input type="checkbox" data-company="${esc(c.name)}" ${chosen.companies.has(c.name) ? "checked" : ""}>
+      <span><b>${esc(c.name)}</b> <span class="pill off">${esc(c.provider)}</span><br><span class="hint">${esc((c.tags || []).join(", "))}</span></span></label>`).join("") || `<div class="empty">no matches</div>`;
+    $$("#company-list [data-company]").forEach((cb) => cb.addEventListener("change", () => cb.checked ? chosen.companies.add(cb.dataset.company) : chosen.companies.delete(cb.dataset.company)));
+    updateCount();
+  };
+  const updateCount = () => { $("#board-count").textContent = `${chosen.boards.size} boards · ${chosen.companies.size} companies`; };
+  $("#co-filter").addEventListener("input", (e) => { boardFilter = e.target.value; renderCompanies(); });
+  $("#co-all").addEventListener("click", () => { boards.companies.forEach((c) => chosen.companies.add(c.name)); renderCompanies(); });
+  $("#co-none").addEventListener("click", () => { chosen.companies.clear(); renderCompanies(); });
+  $$("#remote-boards [data-board]").forEach((cb) => cb.addEventListener("change", () => { cb.checked ? chosen.boards.add(cb.dataset.board) : chosen.boards.delete(cb.dataset.board); updateCount(); }));
+  renderCompanies();
+
+  const saveBoards = async () => {
+    await api("/api/boards", { method: "POST", body: { boards: [...chosen.boards], companies: [...chosen.companies] } });
+    toast(`Saved ${chosen.boards.size} boards + ${chosen.companies.size} companies`);
+  };
+  $("#save-boards").addEventListener("click", saveBoards);
   $("#scan-btn").addEventListener("click", async () => {
+    await saveBoards();
     $("#scan-btn").disabled = true;
-    $("#scan-out").innerHTML = `<div class="empty">${spin} Scanning… a couple of minutes.</div>`;
+    $("#scan-out").innerHTML = `<div class="empty">${spin} Scanning selected boards… a couple of minutes.</div>`;
     try {
       const r = await api("/api/scan", { method: "POST", body: {} });
       $("#scan-out").innerHTML = `<pre class="log">${esc(r.output)}</pre>`;
@@ -534,7 +803,126 @@ stages.scan = async () => {
     } catch (e) { $("#scan-out").innerHTML = ""; toast(e.message, true); }
     $("#scan-btn").disabled = false;
   });
+
+  // background eval controls + polling
+  let bgTimer;
+  const renderBg = (st) => {
+    $("#bg-status").textContent = st.running ? `running — ${st.done}/${st.total}` : st.error ? `error: ${st.error}` : st.done ? `done — ${st.prepared} prepared` : "";
+    $("#bg-progress").innerHTML = (st.running || st.log?.length)
+      ? `${st.running ? `<div class="hint">${spin} ${esc(st.current || "…")}</div>` : ""}
+         ${st.log?.length ? `<pre class="log">${esc(st.log.join("\n"))}</pre>` : ""}` : "";
+  };
+  const poll = async () => { try { const { state: st } = await api("/api/background"); renderBg(st); if (!st.running) { clearInterval(bgTimer); bgTimer = null; state.status = null; } } catch {} };
+  api("/api/background").then(({ state: st }) => { renderBg(st); if (st.running && !bgTimer) bgTimer = setInterval(poll, 4000); });
+  $("#bg-start").addEventListener("click", async () => {
+    try {
+      const { state: st } = await api("/api/background", { method: "POST", body: { action: "start", threshold: parseFloat($("#bg-threshold").value), limit: parseInt($("#bg-limit").value) } });
+      renderBg(st); toast("Background evaluation started"); if (!bgTimer) bgTimer = setInterval(poll, 4000);
+    } catch (e) { toast(e.message, true); }
+  });
+  $("#bg-stop").addEventListener("click", async () => { const { state: st } = await api("/api/background", { method: "POST", body: { action: "stop" } }); renderBg(st); toast("Stopping after the current job…"); });
+
+  // manual add company
+  $("#add-co-btn").addEventListener("click", async () => {
+    const url = $("#add-url").value.trim();
+    if (!url) return toast("Paste a careers URL", true);
+    $("#add-co-btn").disabled = true;
+    try {
+      const r = await api("/api/add-company", { method: "POST", body: { url, name: $("#add-name").value.trim() } });
+      chosen.companies.add(r.name);
+      boards.companies.push({ name: r.name, provider: r.provider, slug: r.slug, tags: ["added"] });
+      boards.companies.sort((a, b) => a.name.localeCompare(b.name));
+      $("#add-url").value = ""; $("#add-name").value = "";
+      renderCompanies();
+      toast(`Added ${r.name} (${r.provider}) — included in your scan`);
+    } catch (e) { toast(e.message, true); }
+    $("#add-co-btn").disabled = false;
+  });
+
+  // daily refresh schedule
+  const renderSched = (sc) => {
+    $("#sched-on").checked = sc.enabled;
+    $("#sched-hour").value = sc.hour;
+    $("#sched-eval").checked = sc.autoEval;
+    $("#sched-next").textContent = sc.enabled && sc.nextRun ? `next: ${new Date(sc.nextRun).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}` : "off";
+    if (sc.lastResult) $("#sched-out").innerHTML = `<p class="hint" style="margin-top:8px">Last run: ${esc(sc.lastResult)}</p>`;
+  };
+  api("/api/schedule").then(({ schedule }) => renderSched(schedule));
+  $("#sched-save").addEventListener("click", async () => {
+    const { schedule } = await api("/api/schedule", { method: "POST", body: { enabled: $("#sched-on").checked, hour: parseInt($("#sched-hour").value), autoEval: $("#sched-eval").checked } });
+    renderSched(schedule);
+    toast(schedule.enabled ? `Daily refresh at ${String(schedule.hour).padStart(2, "0")}:00` : "Daily refresh off");
+  });
+  $("#sched-now").addEventListener("click", async () => {
+    $("#sched-out").innerHTML = `<div class="empty">${spin} Refreshing now…</div>`;
+    try { const r = await api("/api/schedule-run", { method: "POST", body: {} }); $("#sched-out").innerHTML = `<pre class="log">${esc(r.output)}</pre>`; state.status = null; }
+    catch (e) { $("#sched-out").innerHTML = ""; toast(e.message, true); }
+  });
+
   wireNav(4, () => go(6));
+};
+
+/* 8 — Cockpit: the post-setup home. A decision queue, not a portal. */
+stages.cockpit = async () => {
+  const c = await api("/api/cockpit");
+  const bgOn = c.background?.running;
+  const sched = c.schedule;
+  const greeting = new Date().getHours() < 12 ? "Good morning" : new Date().getHours() < 18 ? "Good afternoon" : "Good evening";
+  const name = (state.profileName || "").split(" ")[0] || "";
+  view.innerHTML = `
+    <div class="stage">
+      <div class="page-title">${greeting}${name ? `, ${esc(name)}` : ""}.</div>
+      <p class="page-sub">${c.counts.reviewPrepared ? `${c.counts.reviewPrepared} high-fit application${c.counts.reviewPrepared === 1 ? "" : "s"} prepared and waiting for your call.` : "Your cockpit — everything that needs a decision, in one place."}</p>
+
+      <div class="cockpit-status card">
+        <div class="row">
+          <span class="hint" style="margin:0;flex:1">
+            ${bgOn ? `<span class="spinner"></span> Preparing applications in the background (${c.background.done}/${c.background.total})` :
+              sched.enabled ? `✓ Auto-refresh daily at ${String(sched.hour).padStart(2, "0")}:00 · ${c.counts.review} evaluated in queue` :
+              `Automation off — turn on daily refresh in Discover to keep this current`}
+          </span>
+          <button class="btn small" data-go-idx="${IDX.scan}">Discover</button>
+          ${!bgOn ? `<button class="btn small primary" id="ck-prep">Prepare inbox</button>` : `<button class="btn small" id="ck-stop">Stop</button>`}
+        </div>
+      </div>
+
+      <div class="cockpit-grid">
+        <div>
+          <div class="ck-head">To review · ${c.counts.review}${c.counts.reviewPrepared ? ` · ${c.counts.reviewPrepared} ready` : ""}</div>
+          ${c.review.length ? c.review.slice(0, 12).map((j) => `
+            <div class="ck-card" data-open-url="${esc(j.url || "")}" data-open-co="${esc(j.company || "")}" data-open-role="${esc(j.role || "")}">
+              <div class="row"><div style="flex:1;min-width:0">
+                <div class="ck-title">${esc(j.role || "role")}</div>
+                <div class="hint" style="margin:0">${esc(j.company || "")}</div>
+              </div>
+              <span class="score-badge ${j.score >= 4 ? "hi" : "lo"}" style="font-size:16px;padding:3px 10px">${j.score}/5</span></div>
+              <div class="row" style="margin-top:8px">
+                ${j.prepared ? `<span class="pill ok">prepared</span>` : `<span class="pill off">evaluated</span>`}
+                <button class="btn small primary" style="margin-left:auto">Open →</button>
+              </div>
+            </div>`).join("") : `<div class="card"><div class="empty">Nothing to review yet — scan and evaluate to fill your queue.</div></div>`}
+        </div>
+        <div>
+          <div class="ck-head">Follow-ups${c.counts.followUpsDue ? ` · ${c.counts.followUpsDue} due` : ""}</div>
+          ${c.applied.length ? c.applied.slice(0, 6).map((a) => `
+            <div class="ck-mini"><div style="flex:1;min-width:0"><b>${esc(a.company)}</b><br><span class="hint">${esc(a.role)}</span></div>
+            <span class="pill ${a.followUpDue ? "warn" : "off"}">${a.daysSince}d</span></div>`).join("") : `<p class="hint">No applications yet.</p>`}
+          <div class="ck-head" style="margin-top:16px">Interviewing · ${c.counts.interviewing}</div>
+          ${c.interviewing.length ? c.interviewing.map((i) => `
+            <div class="ck-mini"><div style="flex:1;min-width:0"><b>${esc(i.company)}</b><br><span class="hint">${esc(i.role)}${i.daysToInterview != null ? ` · in ${i.daysToInterview}d` : ""}</span></div>
+            <button class="btn small" data-go-idx="${IDX.track}">Prep</button></div>`).join("") : `<p class="hint">No interviews scheduled.</p>`}
+          <button class="btn" data-go-idx="${IDX.track}" style="width:100%;justify-content:center;margin-top:12px">Open Track →</button>
+        </div>
+      </div>
+    </div>`;
+
+  $$("[data-go-idx]").forEach((b) => b.addEventListener("click", () => go(+b.dataset.goIdx)));
+  $$(".ck-card").forEach((el) => el.addEventListener("click", () => {
+    state.pendingOpen = { url: el.dataset.openUrl || null, company: el.dataset.openCo, role: el.dataset.openRole };
+    go(IDX.board);
+  }));
+  $("#ck-prep")?.addEventListener("click", async () => { await api("/api/background", { method: "POST", body: { action: "start", threshold: 4, limit: 20 } }); toast("Preparing your inbox…"); stages.cockpit(); });
+  $("#ck-stop")?.addEventListener("click", async () => { await api("/api/background", { method: "POST", body: { action: "stop" } }); toast("Stopping…"); stages.cockpit(); });
 };
 
 /* 6 — Apply board (LinkedIn-style rail + workspace) */
@@ -553,59 +941,168 @@ function guessCompany(item) {
   return m ? m[1].replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : (item.title.split(/[—–|@]/)[1] || "").trim();
 }
 let railFilter = "";
+const railState = { loc: "", role: "", tab: "inbox", sort: "default" };
+let currentCvCache = null;
 const wsFor = (id) => (state.ws[id] ||= { jd: "", tab: "evaluate", company: "", role: "", report: null, reportPath: null, score: null, advice: null, answers: null, letter: null });
 
 stages.board = async () => {
   await Promise.all([loadJobs(), loadCatalog()]);
+  // Came from the cockpit with a specific job to open?
+  if (state.pendingOpen) {
+    const p = state.pendingOpen; state.pendingOpen = null;
+    let job = p.url && state.jobs.find((j) => j.url === p.url);
+    if (!job) job = state.jobs.find((j) => (j.company || "").toLowerCase() === (p.company || "").toLowerCase() && (j.role || j.title || "").toLowerCase().includes((p.role || "").toLowerCase()));
+    if (!job && (p.company || p.role)) { job = { id: `m-${Date.now()}`, title: `${p.role} — ${p.company}`, url: p.url, company: p.company, role: p.role, status: "Inbox" }; state.jobs.unshift(job); }
+    if (job) { state.activeJob = job.id; railState.tab = "all"; }
+  }
   view.innerHTML = `
     <div class="stage">
-      <div class="page-title">Applications</div>
-      <p class="page-sub">Work through one job at a time: evaluate the fit, generate a tailored PDF resume, draft answers and a letter — then apply and move to the next. On the posting itself, the <b>browser extension</b> fills the form from here (see <code>studio/extension</code>).</p>
+      <div class="row">
+        <div style="flex:1;min-width:0">
+          <div class="page-title">Applications</div>
+          <p class="page-sub">The posting loads by itself when you pick a job — evaluate, generate the tailored PDF, draft answers, apply, next. On the form itself, the <b>browser extension</b> fills the fields from here.</p>
+        </div>
+        <button class="btn" id="to-track">Applied jobs →</button>
+      </div>
       <div class="board">
         <aside class="job-rail" id="rail"></aside>
         <section class="workspace" id="ws"></section>
       </div>
     </div>`;
+  $("#to-track").addEventListener("click", () => go(7));
   renderRail6();
   renderWorkspace();
 };
 
+function roleWords(role) {
+  return role.toLowerCase().split(/\s+/).filter((w) => w.length > 3 && !/^(senior|junior|staff|principal|lead|associate)$/.test(w));
+}
+
+function topLocations(jobs) {
+  const counts = {};
+  for (const j of jobs) {
+    const loc = (j.location || "").trim();
+    if (loc) counts[loc] = (counts[loc] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 18);
+}
+
 function renderRail6() {
   const rail = $("#rail");
-  const CAP = 120;
+  const CAP = 100;
   const terms = railFilter.toLowerCase().split(/\s+/).filter(Boolean);
-  const match = (j) => !terms.length || terms.every((t) => `${j.title} ${j.company} ${j.location || ""}`.toLowerCase().includes(t));
-  const inboxAll = state.jobs.filter((j) => j.status === "Inbox" && match(j));
-  const tracked = state.jobs.filter((j) => j.status !== "Inbox" && match(j));
-  const inbox = inboxAll.slice(0, CAP);
+  const match = (j) => {
+    if (terms.length && !terms.every((t) => `${j.title} ${j.company} ${j.location || ""}`.toLowerCase().includes(t))) return false;
+    if (railState.loc) {
+      const l = (j.location || "").toLowerCase();
+      if (railState.loc === "__remote" ? !/remote/i.test(`${j.location} ${j.title}`) : l !== railState.loc.toLowerCase()) return false;
+    }
+    if (railState.role && !roleWords(railState.role).every((w) => j.title.toLowerCase().includes(w))) return false;
+    return true;
+  };
+  const byTab = {
+    inbox: (j) => j.status === "Inbox",
+    progress: (j) => j.status !== "Inbox" && !["Applied", "Responded", "Interview", "Offer"].includes(j.status),
+    applied: (j) => ["Applied", "Responded", "Interview", "Offer"].includes(j.status),
+    all: () => true,
+  };
+  let list = state.jobs.filter((j) => match(j) && byTab[railState.tab](j));
+  if (railState.sort === "company") list = [...list].sort((a, b) => (a.company || "").localeCompare(b.company || ""));
+  if (railState.sort === "title") list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+  if (railState.sort === "score") list = [...list].sort((a, b) => (parseFloat(b.score) || 0) - (parseFloat(a.score) || 0));
+  const total = list.length;
+  list = list.slice(0, CAP);
+
+  const counts = {
+    inbox: state.jobs.filter(byTab.inbox).length,
+    progress: state.jobs.filter(byTab.progress).length,
+    applied: state.jobs.filter(byTab.applied).length,
+  };
   const card = (j) => `
     <div class="job-card ${state.activeJob === j.id ? "active" : ""}" data-id="${j.id}">
       <div class="jc-title">${esc(j.title)}</div>
       <div class="jc-meta">
-        ${j.status !== "Inbox" ? `<span class="pill ${j.status === "Applied" ? "ok" : "off"}">${esc(j.status)}</span>` : ""}
+        ${j.status !== "Inbox" ? `<span class="pill ${["Applied", "Interview", "Offer"].includes(j.status) ? "ok" : "off"}">${esc(j.status)}</span>` : ""}
         ${j.score && j.score !== "-" ? `<span>${esc(j.score)}</span>` : ""}
         ${j.company ? `<span>${esc(j.company)}</span>` : ""}
-        ${j.location ? `<span>· ${esc(j.location)}</span>` : ""}
+        ${j.location ? `<span>· ${esc(j.location.slice(0, 26))}</span>` : ""}
       </div>
     </div>`;
+
   rail.innerHTML = `
-    <input type="text" id="rail-q" placeholder="Filter ${state.jobs.length.toLocaleString()} jobs…" value="${esc(railFilter)}" style="margin-bottom:8px">
-    ${tracked.length ? `<div class="rail-head">In progress · ${tracked.length}</div>` + tracked.map(card).join("") : ""}
-    ${inbox.length ? `<div class="rail-head">Inbox · ${inboxAll.length.toLocaleString()}${inboxAll.length > CAP ? ` (showing ${CAP} — filter to narrow)` : ""}</div>` + inbox.map(card).join("") : ""}
-    ${!state.jobs.length ? `<div class="empty">No jobs yet — run a scan, or add one below.</div>` : ""}
+    <div class="ws-tabs" style="margin:0 0 8px">
+      ${[["inbox", `Inbox ${counts.inbox.toLocaleString()}`], ["progress", `Evaluated ${counts.progress}`], ["applied", `Applied ${counts.applied}`], ["all", "All"]]
+        .map(([id, l]) => `<button class="ws-tab ${railState.tab === id ? "active" : ""}" data-rtab="${id}">${l}</button>`).join("")}
+    </div>
+    <input type="text" id="rail-q" placeholder="Search title, company…" value="${esc(railFilter)}" style="margin-bottom:6px">
+    <div class="row" style="gap:6px;margin-bottom:8px">
+      <select id="rail-loc" style="flex:1;font-size:12.5px;padding:6px 8px">
+        <option value="">All locations</option>
+        <option value="__remote" ${railState.loc === "__remote" ? "selected" : ""}>Remote</option>
+        ${topLocations(state.jobs).map(([l, n]) => `<option value="${esc(l)}" ${railState.loc === l ? "selected" : ""}>${esc(l.slice(0, 28))} (${n})</option>`).join("")}
+      </select>
+      <select id="rail-role" style="flex:1;font-size:12.5px;padding:6px 8px">
+        <option value="">All my roles</option>
+        ${state.selectedRoles.map((r) => `<option ${railState.role === r ? "selected" : ""}>${esc(r)}</option>`).join("")}
+      </select>
+      <select id="rail-sort" style="font-size:12.5px;padding:6px 8px">
+        ${[["default", "Sort"], ["company", "Company A–Z"], ["title", "Title A–Z"], ["score", "Score"]]
+          .map(([v, l]) => `<option value="${v}" ${railState.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+      </select>
+    </div>
+    <div class="rail-head">${total.toLocaleString()} match${total === 1 ? "" : "es"}${total > CAP ? ` · showing ${CAP}` : ""}</div>
+    ${list.map(card).join("") || `<div class="empty">Nothing here — adjust the filters or run a scan.</div>`}
     <button class="btn small" id="add-job" style="width:100%;justify-content:center;margin-top:6px">+ Add a job manually</button>`;
+
+  $$("#rail [data-rtab]").forEach((b) => b.addEventListener("click", () => { railState.tab = b.dataset.rtab; renderRail6(); }));
   const q = $("#rail-q");
   q.addEventListener("input", () => { railFilter = q.value; const pos = q.selectionStart; renderRail6(); const nq = $("#rail-q"); nq.focus(); nq.setSelectionRange(pos, pos); });
+  $("#rail-loc").addEventListener("change", (e) => { railState.loc = e.target.value; renderRail6(); });
+  $("#rail-role").addEventListener("change", (e) => { railState.role = e.target.value; renderRail6(); });
+  $("#rail-sort").addEventListener("change", (e) => { railState.sort = e.target.value; renderRail6(); });
   $$("#rail .job-card").forEach((c) => c.addEventListener("click", () => { state.activeJob = c.dataset.id; renderRail6(); renderWorkspace(); }));
   $("#add-job").addEventListener("click", () => {
     const id = `m-${Date.now()}`;
     state.jobs.unshift({ id, title: "New application", url: null, company: "", role: "", status: "Inbox" });
     state.activeJob = id;
+    railState.tab = "inbox";
     renderRail6(); renderWorkspace();
   });
 }
 
 function scoreOf(report) { return report ? parseFloat((report.match(/(\d(?:\.\d)?)\s*\/\s*5/) || [])[1]) || null : null; }
+
+// The posting, as close to the original as we can get it — fetched from the
+// ATS API (rich HTML) or page text, with manual paste only as a last resort.
+function jdBlock(job, w) {
+  if (!job.url && !w.jd) {
+    return `<label class="field">Job description</label>
+      <textarea id="w-jd" style="min-height:120px" placeholder="No posting URL for this one — paste the JD text">${esc(w.jd)}</textarea>`;
+  }
+  if (w.jdStatus === "loading") {
+    return `<div class="posting"><div class="empty"><span class="spinner"></span> Retrieving the posting…</div></div>`;
+  }
+  if (w.jdStatus === "failed" && !w.jd) {
+    return `<div class="note">Couldn't fetch this posting automatically (${esc(w.jdErr || "")}). <button class="btn small" id="jd-retry">Retry</button></div>
+      <label class="field">Job description</label>
+      <textarea id="w-jd" style="min-height:120px" placeholder="Paste the JD text here">${esc(w.jd)}</textarea>`;
+  }
+  const body = w.jdHtml
+    ? `<div class="posting-body prose">${w.jdHtml}</div>`
+    : `<div class="posting-body" style="white-space:pre-wrap">${esc(w.jd)}</div>`;
+  return `
+    <div class="posting">
+      <div class="row" style="margin-bottom:6px">
+        <span class="pill ok" style="margin-right:auto">${esc(w.jdSource === "page-text" ? "retrieved from page" : "live from " + (w.jdSource || "posting").replace("-api", ""))}</span>
+        ${w.location ? `<span class="pill off">${esc(w.location)}</span>` : ""}
+        <button class="btn small" id="jd-retry">↻</button>
+      </div>
+      ${body}
+    </div>
+    <details style="margin-top:8px"><summary class="hint" style="cursor:pointer">Edit JD text (what the AI reads)</summary>
+      <textarea id="w-jd" style="min-height:120px;margin-top:6px">${esc(w.jd)}</textarea>
+    </details>`;
+}
 
 function renderWorkspace() {
   const wsEl = $("#ws");
@@ -615,7 +1112,43 @@ function renderWorkspace() {
   w.company ||= job.company || ""; w.role ||= job.role || "";
   const score = w.score ?? (job.score ? parseFloat(job.score) : null);
 
-  const TABS = [["evaluate", "Evaluate"], ["tailor", "Tailor resume"], ["answers", "Answers"], ["letter", "Cover letter"]];
+  // Restore any previously-produced artifacts for this posting (once).
+  if (!w.restored) {
+    w.restored = true;
+    const qs = new URLSearchParams({ url: job.url || "", company: w.company, role: w.role });
+    api(`/api/job-state?${qs}`).then(({ state: s }) => {
+      if (!s) return;
+      for (const k of ["report", "reportPath", "score", "market", "marketSources", "pdf", "tailorSummary", "letter"]) if (s[k] != null && w[k] == null) w[k] = s[k];
+      if (state.activeJob === job.id) renderWorkspace();
+    }).catch(() => {});
+  }
+
+  // Auto-retrieve the posting — the user should never have to paste a JD.
+  if (job.url && w.jdStatus === undefined) {
+    w.jdStatus = "loading";
+    api("/api/fetch-jd", { method: "POST", body: { url: job.url } })
+      .then((r) => {
+        w.jdStatus = "ok";
+        w.jd = w.jd || r.text;
+        w.jdHtml = r.html;
+        w.jdSource = r.source;
+        if (!w.company && r.company) w.company = r.company.replace(/\b\w/g, (c) => c.toUpperCase());
+        if ((!w.role || w.role === job.title) && r.title) w.role = r.title;
+        w.location = r.location || job.location || "";
+        if (state.activeJob === job.id) renderWorkspace();
+      })
+      .catch((e) => {
+        w.jdStatus = "failed";
+        w.jdErr = e.message;
+        if (state.activeJob === job.id) renderWorkspace();
+      });
+  }
+
+  const st = w.step || "idle"; // idle → evaluating → marketing → tailoring → covering → done
+  const running = w.running;
+  const doneStep = { evaluating: !!w.report, marketing: !!w.market, tailoring: !!w.pdf, covering: !!w.letter };
+  const stepLabel = { evaluating: "Evaluating fit (A–G)", marketing: "Reading the current market", tailoring: "Tailoring your résumé → PDF", covering: "Drafting the cover letter" };
+
   wsEl.innerHTML = `
     <div class="card">
       <div class="row">
@@ -631,112 +1164,200 @@ function renderWorkspace() {
         <div><label class="field">Company</label><input type="text" id="w-company" value="${esc(w.company)}"></div>
         <div><label class="field">Role title</label><input type="text" id="w-role" value="${esc(w.role)}" placeholder="e.g. ${esc(state.selectedRoles[0] || "Machine Learning Engineer")}"></div>
       </div>
-      <label class="field">Job description ${job.url ? `<span style="font-weight:400;color:var(--faint)">— open the posting and paste the JD text</span>` : ""}</label>
-      <textarea id="w-jd" style="min-height:120px" placeholder="Paste the full JD — it powers all four tabs below">${esc(w.jd)}</textarea>
-      <div class="ws-tabs">${TABS.map(([id, l]) => `<button class="ws-tab ${w.tab === id ? "active" : ""}" data-tab="${id}">${l}</button>`).join("")}</div>
-      <div id="tab-body"></div>
+      ${jdBlock(job, w)}
+      ${!running && !w.report ? `<div class="row" style="margin-top:12px"><button class="btn primary" id="run-pipe">✦ Prepare this application</button><span class="hint" style="margin:0">Evaluates fit, reads the market, tailors your résumé, drafts a cover letter — one pass. A few minutes on local models.</span></div>` : ""}
+      ${running || w.report ? pipelineStepper(w, doneStep, stepLabel) : ""}
     </div>
-    ${score !== null && score < 4 ? `<div class="note ethics"><b>Below the bar.</b> career-ops recommends against applying under 4/5 — your time and the recruiter's are worth more. Skip unless you have a specific reason.</div>` : ""}`;
+    ${score !== null && score < 4 ? `<div class="note ethics"><b>Below the bar.</b> career-ops recommends against applying under 4/5 — your time and the recruiter's are worth more. Skip unless you have a specific reason.</div>` : ""}
+    <div id="pipe-sections"></div>`;
 
   $("#w-company").addEventListener("input", (e) => (w.company = e.target.value));
   $("#w-role").addEventListener("input", (e) => (w.role = e.target.value));
-  $("#w-jd").addEventListener("input", (e) => (w.jd = e.target.value));
-  $$(".ws-tab").forEach((t) => t.addEventListener("click", () => { w.tab = t.dataset.tab; renderWorkspace(); }));
-
+  $("#w-jd")?.addEventListener("input", (e) => (w.jd = e.target.value));
+  $("#jd-retry")?.addEventListener("click", () => { w.jdStatus = undefined; renderWorkspace(); });
   $("#mark-applied").addEventListener("click", () => trackJob(job, w, "Applied"));
   $("#mark-skip").addEventListener("click", () => trackJob(job, w, "SKIP"));
+  $("#run-pipe")?.addEventListener("click", () => runPipeline(job, w));
 
-  const tb = $("#tab-body");
-  const busy = (msg) => (tb.innerHTML = `<div class="empty">${spin} ${esc(msg)}</div>`);
+  renderPipeSections(job, w);
+}
 
-  if (w.tab === "evaluate") {
-    tb.innerHTML = w.report
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-eval">Re-run</button><button class="btn small" id="cp">Copy</button></div><div class="prose">${md(w.report)}</div>`
-      : `<button class="btn primary" id="run-eval">Run A–G evaluation</button><p class="hint" style="margin-top:8px">Full career-ops report: fit score, gaps, leverage, verdict. Local models take a few minutes.</p>`;
-    (tb.querySelector("#run-eval") || tb.querySelector("#re-eval"))?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 100) return toast("Paste the JD first", true);
-      busy("Evaluating against your resume…");
-      try {
-        const r = await api("/api/evaluate", { method: "POST", body: { jd: w.jd } });
-        w.report = r.report; w.reportPath = r.reportPath; w.score = scoreOf(r.report);
-        if (w.company && w.role) await api("/api/track", { method: "POST", body: { company: w.company, role: w.role, status: "Evaluated", score: w.score, reportPath: w.reportPath, note: "via Studio" } }).catch(() => {});
-        renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.report));
+function pipelineStepper(w, done, labels) {
+  const order = ["evaluating", "marketing", "tailoring", "covering"];
+  return `<div class="stepper">${order.map((s) => {
+    const isDone = done[s], isNow = w.running && w.step === s;
+    return `<div class="step ${isDone ? "done" : ""} ${isNow ? "now" : ""}">
+      <span class="dot">${isDone ? "✓" : isNow ? "●" : "○"}</span>${esc(labels[s])}${isNow ? ` ${spin}` : ""}</div>`;
+  }).join("")}</div>`;
+}
+
+// The auto-pipeline: JD → evaluate → market → tailor (with eval+market as
+// context) → cover letter. Each artifact persists to the backend job store so
+// reopening the job restores everything.
+async function runPipeline(job, w) {
+  if (w.running) return;
+  if ((w.jd || "").trim().length < 80) return toast("The job description hasn't loaded yet", true);
+  if (!w.company || !w.role) return toast("Fill in company and role first", true);
+  w.running = true;
+  const persist = (patch) => api("/api/job-state", { method: "POST", body: { url: job.url, company: w.company, role: w.role, patch } }).catch(() => {});
+  api("/api/telemetry", { method: "POST", body: { event: "pipeline_start", data: { company: w.company } } }).catch(() => {});
+  try {
+    if (!w.report) {
+      w.step = "evaluating"; renderWorkspace();
+      const r = await api("/api/evaluate", { method: "POST", body: { jd: w.jd } });
+      w.report = r.report; w.reportPath = r.reportPath; w.score = scoreOf(r.report);
+      await api("/api/track", { method: "POST", body: { company: w.company, role: w.role, status: "Evaluated", score: w.score, reportPath: w.reportPath, note: "via Studio" } }).catch(() => {});
+      await persist({ report: w.report, reportPath: w.reportPath, score: w.score });
+      renderPipeSections(job, w);
+    }
+    if (!w.market) {
+      w.step = "marketing"; renderWorkspace();
+      const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } });
+      w.market = r.summary; w.marketSources = r.sources;
+      await persist({ market: w.market, marketSources: w.marketSources });
+      renderPipeSections(job, w);
+    }
+    if (!w.pdf) {
+      w.step = "tailoring"; renderWorkspace();
+      // eval + market flow in as tailoring context
+      const context = [w.report ? `FIT ANALYSIS:\n${w.report}` : "", w.market ? `MARKET:\n${w.market}` : ""].filter(Boolean).join("\n\n");
+      const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } });
+      w.pdf = r.pdf; w.tailorSummary = r.summary;
+      await persist({ pdf: w.pdf, tailorSummary: w.tailorSummary });
+      renderPipeSections(job, w);
+    }
+    if (!w.letter) {
+      w.step = "covering"; renderWorkspace();
+      const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
+      w.letter = r.letter;
+      await persist({ letter: w.letter });
+    }
+    w.step = "done";
+    toast("Application prepared — review each part below");
+  } catch (e) { toast(e.message, true); }
+  w.running = false;
+  renderWorkspace();
+}
+
+// The linear result sections (no tabs): Fit → Tailored résumé (+ inline
+// collapsible improve chat) → Cover letter → Application answers.
+function renderPipeSections(job, w) {
+  const host = $("#pipe-sections");
+  if (!host) return;
+  const sections = [];
+
+  if (w.report) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Fit ${w.score ? `· ${w.score}/5` : ""}</h3>
+      <button class="btn small" data-act="re-eval">Re-run</button></div>
+      <details><summary class="hint" style="cursor:pointer">Full A–G report</summary><div class="prose">${md(w.report)}</div></details></div>`);
+
+  if (w.market) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Market intel</h3>
+      <button class="btn small" data-act="re-market">Refresh</button></div>
+      <details><summary class="hint" style="cursor:pointer">What this role needs right now${w.marketSources?.length ? ` · sources ${w.marketSources.map((s, i) => `<a href="${esc(s.url)}" target="_blank">[${i + 1}]</a>`).join(" ")}` : ""}</summary><div class="prose">${md(w.market)}</div></details></div>`);
+
+  if (w.pdf) {
+    w.improveMsgs ||= [];
+    sections.push(`
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Tailored résumé</h3>
+          <a class="btn small" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download PDF</a>
+          <button class="btn small" data-act="latex">⤓ LaTeX</button>
+          <button class="btn small" data-act="re-tailor">Regenerate</button>
+          <button class="btn small" data-act="toggle-improve">${w.improveOpen ? "Close improve chat ✕" : "Improve ✎"}</button>
+        </div>
+        <div id="tailor-latex-out"></div>
+        <p class="hint">Reordered & rephrased for this JD using the fit + market analysis above — same facts, ATS-clean. Saved to <code>output/${esc(w.pdf)}</code>.</p>
+        <div class="improve-split ${w.improveOpen ? "open" : ""}">
+          <div class="improve-preview">
+            <div class="row" style="margin-bottom:6px"><b style="margin-right:auto;font-size:12.5px">Résumé preview</b>
+              ${w.improveDraft ? `<button class="btn small primary" data-act="imp-accept">Save to cv.md</button>` : ""}</div>
+            <div class="preview-body prose" id="imp-body">${md(w.improveDraft || currentCvCache || "Loading…")}</div>
+          </div>
+          <div class="improve-chat">
+            <div class="chat-log" id="imp-log">${w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") || `<div class="empty" style="padding:12px">Ask me to sharpen bullets or align wording — I'll show the new résumé on the left. Same facts, better told.</div>`}</div>
+            <div class="row" style="margin-top:8px"><input type="text" id="imp-in" placeholder="e.g. lead the summary with GenAI"><button class="btn primary" data-act="imp-send">Send</button></div>
+          </div>
+        </div>
+      </div>`);
   }
 
-  if (w.tab === "tailor") {
-    tb.innerHTML = `
-      <div class="row" style="margin:4px 0 10px">
-        <button class="btn primary" id="run-pdf">⤓ ${w.pdf ? "Regenerate" : "Generate"} tailored PDF resume</button>
-        <button class="btn" id="run-t">${w.advice ? "Re-run tailoring notes" : "Tailoring notes"}</button>
-        ${w.pdf ? `<a class="btn" href="/api/pdf-file?f=${encodeURIComponent(w.pdf)}">Download ${esc(w.pdf)}</a>` : ""}
-      </div>
-      ${w.pdf ? `<div class="note"><b>PDF ready.</b> Your resume, reordered and rephrased for this JD — same facts, ATS-clean layout — also saved to <code>output/${esc(w.pdf)}</code>. Read it before you attach it.</div>` : `<p class="hint">One click: your resume tailored to this JD and rendered as an ATS-clean PDF through the career-ops template. Reformulates — never fabricates.</p>`}
-      ${w.advice ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="cp">Copy notes</button></div><div class="prose">${md(w.advice)}</div>` : ""}`;
-    tb.querySelector("#run-pdf")?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
-      busy("Tailoring your resume and rendering the PDF… (local models: a few minutes)");
-      try {
-        const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.pdf = r.pdf;
-        renderWorkspace();
-        toast("Tailored PDF ready — review it before attaching");
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#run-t")?.addEventListener("click", async () => {
-      if ((w.jd || "").trim().length < 80) return toast("Paste the JD first", true);
-      busy("Analysing fit and tailoring…");
-      try {
-        const r = await api("/api/tailor", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.advice = r.advice; renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.advice));
-  }
+  if (w.letter) sections.push(`
+    <div class="card"><div class="row"><h3 style="margin-right:auto">Cover letter</h3>
+      <button class="btn small" data-act="cl-copy">Copy</button>
+      <button class="btn small" data-act="cl-dl">Download</button>
+      <button class="btn small" data-act="re-letter">Rewrite</button></div>
+      <div class="prose">${md(w.letter)}</div></div>`);
 
-  if (w.tab === "answers") {
+  // Application answers stay available as a collapsible section
+  if (w.report || w.pdf) {
     const qs = questionsForRole(w.role);
-    tb.innerHTML = `
-      <p class="hint">${qs.length} questions typically asked for this role — answered from your resume <i>and</i> your onboarding interview (salary, authorization, notice…).</p>
-      <button class="btn primary" id="run-a">${w.answers ? "Re-draft answers" : "Draft all answers"}</button>
-      <div style="margin-top:12px">${qs.map((q, i) => `
-        <div class="qa"><div class="q">${esc(q)}</div><div class="a">${w.answers?.[i] ? markAdds(w.answers[i]) : ""}</div>
-        ${w.answers?.[i] ? `<div class="tools row"><button class="btn small" data-cp="${i}">Copy</button></div>` : ""}</div>`).join("")}</div>`;
-    tb.querySelector("#run-a").addEventListener("click", async () => {
-      busy("Drafting answers from your resume + interview…");
-      try {
-        const r = await api("/api/answers", { method: "POST", body: { questions: qs, jd: w.jd, company: w.company, role: w.role } });
-        w.answers = qs.map((q, i) => r.answers[i]?.a || r.answers.find((x) => x.q === q)?.a || "");
-        renderWorkspace();
-        toast("Drafted — review every answer before pasting anywhere");
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    $$("[data-cp]", tb).forEach((b) => b.addEventListener("click", () => copyText(w.answers[+b.dataset.cp])));
+    sections.push(`
+      <div class="card"><div class="row"><h3 style="margin-right:auto">Application answers</h3>
+        <button class="btn small primary" data-act="answers">${w.answers ? "Re-draft" : "Draft answers"}</button></div>
+        <p class="hint">${qs.length} questions typically asked, from your résumé + interview facts.</p>
+        <div id="answers-body">${(w.answers || []).map((a, i) => `<div class="qa"><div class="q">${esc(qs[i])}</div><div class="a">${a ? markAdds(a) : ""}</div>${a ? `<div class="tools row"><button class="btn small" data-cp="${i}">Copy</button></div>` : ""}</div>`).join("")}</div></div>`);
   }
 
-  if (w.tab === "letter") {
-    tb.innerHTML = w.letter
-      ? `<div class="row end" style="margin:4px 0"><button class="btn small" id="re-l">Re-write</button><button class="btn small" id="cp">Copy</button><button class="btn small" id="dl">Download .md</button></div><div class="prose">${md(w.letter)}</div>`
-      : `<button class="btn primary" id="run-l">Write cover letter</button><p class="hint" style="margin-top:8px">3–4 tight paragraphs grounded in your resume.</p>`;
-    (tb.querySelector("#run-l") || tb.querySelector("#re-l"))?.addEventListener("click", async () => {
-      if (!w.company && !w.jd) return toast("Give me at least a company name or the JD", true);
-      busy("Writing…");
-      try {
-        const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } });
-        w.letter = r.letter; renderWorkspace();
-      } catch (e) { toast(e.message, true); renderWorkspace(); }
-    });
-    tb.querySelector("#cp")?.addEventListener("click", () => copyText(w.letter));
-    tb.querySelector("#dl")?.addEventListener("click", () => {
-      const a = Object.assign(document.createElement("a"), {
-        href: URL.createObjectURL(new Blob([w.letter], { type: "text/markdown" })),
-        download: `cover-letter-${(w.company || "draft").toLowerCase().replace(/\s+/g, "-")}.md`,
-      });
-      a.click();
-    });
-  }
+  host.innerHTML = sections.join("");
+  if (!currentCvCache && w.pdf) api("/api/resume").then((r) => { currentCvCache = r.content; if (!w.improveDraft) { const b = $("#imp-body"); if (b) b.innerHTML = md(r.content); } });
+  wireSections(job, w);
+}
+
+function wireSections(job, w) {
+  const reRun = async (fn, msg) => { toast(msg); try { await fn(); } catch (e) { toast(e.message, true); } renderWorkspace(); };
+  const on = (act, handler) => $$(`[data-act="${act}"]`).forEach((b) => b.addEventListener("click", handler));
+
+  on("re-eval", () => { w.report = null; w.step = "evaluating"; w.running = false; runPipeline(job, w); });
+  on("re-market", () => reRun(async () => { const r = await api("/api/market-trends", { method: "POST", body: { role: w.role, jd: w.jd } }); w.market = r.summary; w.marketSources = r.sources; }, "Refreshing market…"));
+  on("re-tailor", () => reRun(async () => { const context = [w.report && `FIT:\n${w.report}`, w.market && `MARKET:\n${w.market}`].filter(Boolean).join("\n\n"); const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } }); w.pdf = r.pdf; }, "Regenerating résumé…"));
+  on("latex", async () => {
+    const out = $("#tailor-latex-out");
+    out.innerHTML = `<div class="note">${spin} Building LaTeX + PDF from this tailored résumé…</div>`;
+    try {
+      const draft = w.improveDraft || currentCvCache;
+      const r = await api("/api/resume-docs", { method: "POST", body: { draft } });
+      renderDocsLinks(out, r, draft);
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+  });
+  on("re-letter", () => reRun(async () => { const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; }, "Rewriting letter…"));
+  on("toggle-improve", () => { w.improveOpen = !w.improveOpen; renderPipeSections(job, w); });
+  on("cl-copy", () => copyText(w.letter));
+  on("cl-dl", () => { const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([w.letter], { type: "text/markdown" })), download: `cover-letter-${(w.company || "draft").toLowerCase().replace(/\s+/g, "-")}.md` }); a.click(); });
+
+  on("answers", async () => {
+    const qs = questionsForRole(w.role);
+    $("#answers-body").innerHTML = `<div class="empty">${spin} Drafting…</div>`;
+    try {
+      const r = await api("/api/answers", { method: "POST", body: { questions: qs, jd: w.jd, company: w.company, role: w.role } });
+      w.answers = qs.map((q, i) => r.answers[i]?.a || r.answers.find((x) => x.q === q)?.a || "");
+      renderPipeSections(job, w);
+    } catch (e) { toast(e.message, true); renderPipeSections(job, w); }
+  });
+  $$("[data-cp]").forEach((b) => b.addEventListener("click", () => copyText(w.answers[+b.dataset.cp])));
+
+  // improve chat
+  const impSend = async () => {
+    const input = $("#imp-in");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    w.improveMsgs.push({ role: "user", content: text });
+    $("#imp-log").innerHTML = w.improveMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("") + `<div class="msg assistant">${spin}</div>`;
+    $("#imp-log").scrollTop = 1e9;
+    try {
+      const r = await api("/api/resume-chat", { method: "POST", body: { messages: w.improveMsgs, jd: w.jd, company: w.company, role: w.role } });
+      w.improveMsgs.push({ role: "assistant", content: r.reply.replace(/```(?:markdown|md)?\n[\s\S]*?```/, "_(updated résumé shown in the preview →)_") });
+      if (r.draft) w.improveDraft = r.draft;
+      renderPipeSections(job, w);
+    } catch (e) { w.improveMsgs.pop(); toast(e.message, true); renderPipeSections(job, w); }
+  };
+  on("imp-send", impSend);
+  $("#imp-in")?.addEventListener("keydown", (e) => { if (e.key === "Enter") impSend(); });
+  on("imp-accept", async () => {
+    if (!confirm("Replace your master résumé (cv.md) with this improved version?")) return;
+    try { await api("/api/resume", { method: "POST", body: { content: w.improveDraft } }); currentCvCache = w.improveDraft; toast("Saved to cv.md"); } catch (e) { toast(e.message, true); }
+  });
 }
 
 function questionsForRole(roleTitle) {
@@ -751,18 +1372,198 @@ function questionsForRole(roleTitle) {
 async function trackJob(job, w, status) {
   if (!w.company || !w.role) return toast("Fill in company and role title first", true);
   if (status === "Applied" && w.score !== null && w.score < 4 && !confirm(`This scored ${w.score}/5 — below the apply bar. Mark as applied anyway?`)) return;
+  // Feedback loop: capture what happened at submit time while it's fresh —
+  // it lands in the tracker notes and future you (and Track) will see it.
+  let note = "";
+  if (status === "Applied") {
+    note = prompt("Applied ✓ — any notes while it's fresh? (fields the form asked that surprised you, referral used, salary you entered… optional)") || "";
+    note = note ? `applied via Studio — ${note}` : "applied via Studio (manually submitted)";
+  }
   try {
     const r = await api("/api/track", { method: "POST", body: {
       company: w.company, role: w.role, status,
-      score: w.score, reportPath: w.reportPath, note: status === "Applied" ? "applied via Studio (manually submitted)" : "",
+      score: w.score, reportPath: w.reportPath, note,
     }});
-    toast(status === "Applied" ? `Tracked as Applied (#${r.num}) — onward!` : "Skipped — onward!");
+    toast(status === "Applied" ? `Tracked as Applied (#${r.num}) — it's now in Track` : "Skipped — onward!");
     const idx = state.jobs.findIndex((j) => j.id === job.id);
     await loadJobs();
     state.activeJob = state.jobs[Math.min(idx, state.jobs.length - 1)]?.id || null;
     renderRail6(); renderWorkspace();
   } catch (e) { toast(e.message, true); }
 }
+
+/* 7 — Track: everything after you hit submit */
+stages.track = async () => {
+  const [ck, { cadence }, { plugins }] = await Promise.all([
+    api("/api/cockpit"), api("/api/followups"), api("/api/plugins"),
+  ]);
+  const cadenceFor = (company) => {
+    const list = cadence?.followups || cadence?.applications || (Array.isArray(cadence) ? cadence : []);
+    return list.find?.((c) => (c.company || "").toLowerCase() === company.toLowerCase());
+  };
+  const gmail = plugins.find((p) => p.id === "gmail");
+  const NEXT = { Applied: "Responded", Responded: "Interview", Interview: "Offer" };
+
+  // Lane 1 — to review (from the artifact store)
+  const reviewCards = ck.review.map((j) => `
+    <div class="lane-card" data-open-url="${esc(j.url || "")}" data-open-co="${esc(j.company || "")}" data-open-role="${esc(j.role || "")}">
+      <div class="lc-title">${esc(j.role || "role")}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(j.company || "")}</div>
+      <div class="row" style="margin-top:7px"><span class="pill ${j.prepared ? "ok" : "off"}">${j.prepared ? "prepared" : "evaluated"}</span>
+      <span class="score-badge ${j.score >= 4 ? "hi" : "lo"}" style="font-size:13px;padding:2px 8px;margin-left:auto">${j.score}/5</span></div>
+    </div>`).join("") || `<div class="empty" style="padding:20px 8px">Nothing to review.</div>`;
+
+  // Lane 2 — applied (monitor + follow-up)
+  const appliedCards = ck.applied.map((r) => {
+    const c = cadenceFor(r.company);
+    const nudge = c?.next_action || c?.action ? `Follow-up: ${c.next_action || c.action}` : (r.followUpDue ? `${r.daysSince}d silent — a polite nudge is fair now` : "");
+    return `
+    <div class="lane-card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
+      <div class="lc-title">${esc(r.role)}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(r.company)} · ${r.daysSince}d ago</div>
+      ${nudge ? `<div class="lc-note">${esc(nudge)}</div>` : ""}
+      <div class="row" style="margin-top:8px">
+        <button class="btn small" data-followup data-days="${r.daysSince}">Follow-up ✎</button>
+        ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">Heard back →</button>` : ""}
+        <button class="btn small" data-status="Rejected">✕</button>
+      </div>
+      <div class="followup-out"></div>
+    </div>`;
+  }).join("") || `<div class="empty" style="padding:20px 8px">No applications yet.</div>`;
+
+  // Lane 3 — interviewing (prep + roadmap)
+  const ivCards = ck.interviewing.map((r) => `
+    <div class="lane-card" data-co="${esc(r.company)}" data-role="${esc(r.role)}">
+      <div class="lc-title">${esc(r.role)}</div>
+      <div class="hint" style="margin:2px 0 0">${esc(r.company)}${r.daysToInterview != null ? ` · in ${r.daysToInterview}d` : ""}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn small primary" data-prep>Prep</button>
+        <label class="hint" style="margin:0">📅<input type="date" data-ivdate value="${esc(r.interviewDate || "")}" style="width:auto;padding:3px 6px;font-size:12px"></label>
+        ${NEXT[r.status] ? `<button class="btn small" data-status="${NEXT[r.status]}">→</button>` : ""}
+      </div>
+      <div class="prep-out" style="margin-top:8px"></div>
+    </div>`).join("") || `<div class="empty" style="padding:20px 8px">No interviews scheduled.</div>`;
+
+  view.innerHTML = `
+    <div class="stage">
+      <div class="row">
+        <div style="flex:1"><div class="page-title">Pipeline</div>
+          <p class="page-sub">Your whole hunt on one board — jobs move left to right as they progress. Update a status the moment you hear back; the cockpit and prep react.</p></div>
+      </div>
+      <div class="lanes">
+        <div class="lane"><div class="lane-head">To review <span>${ck.counts.review}</span></div><div class="lane-body" id="lane-review">${reviewCards}</div></div>
+        <div class="lane"><div class="lane-head">Applied${ck.counts.followUpsDue ? ` · ${ck.counts.followUpsDue} due` : ""} <span>${ck.counts.applied}</span></div><div class="lane-body">${appliedCards}</div></div>
+        <div class="lane"><div class="lane-head">Interviewing <span>${ck.counts.interviewing}</span></div><div class="lane-body">${ivCards}</div></div>
+      </div>
+      <div class="card">
+        <div class="row"><h3 style="margin-right:auto">Inbox connectors</h3></div>
+        <p class="hint">Connect your email so recruiter replies land in your pipeline and statuses stay in sync — nothing leaves your machine except to your own provider.</p>
+        <div class="connectors">
+          <div class="connector ${gmail?.enabled ? "on" : ""}">
+            <div class="row"><b style="margin-right:auto">✉️ Gmail</b><span class="pill ${gmail?.enabled ? "ok" : "off"}">${gmail?.enabled ? "connected" : "not connected"}</span></div>
+            ${gmail?.enabled
+              ? `<p class="hint">Label recruiter emails in Gmail; Studio pulls them in.</p><button class="btn small" id="gmail-run">Pull from Gmail</button><div id="gmail-out"></div>`
+              : `<p class="hint">Read-only via career-ops' Gmail plugin (your own OAuth). Enable <code>gmail</code> in <code>config/plugins.yml</code> + add ${esc((gmail?.missingEnv || ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]).join(", "))} to <code>.env</code>.</p><a class="btn small" href="https://github.com/santifer/career-ops/blob/main/docs/PLUGINS.md" target="_blank">Setup guide</a>`}
+          </div>
+          <div class="connector">
+            <div class="row"><b style="margin-right:auto">📥 Paste a recruiter reply</b></div>
+            <p class="hint">No connector needed — paste any recruiter email and Studio suggests the status update.</p>
+            <textarea id="infer-text" placeholder="Paste the recruiter's message…" style="min-height:70px"></textarea>
+            <div class="row" style="margin-top:6px"><button class="btn small" id="infer-btn">Read & suggest status</button></div>
+            <div id="infer-out"></div>
+          </div>
+          <div class="connector">
+            <div class="row"><b style="margin-right:auto">📅 Outlook / Microsoft 365</b><span class="pill off">planned</span></div>
+            <p class="hint">Outlook connector is on the roadmap — the same read-only, local-first model.</p>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  // Review cards open in the Apply workspace.
+  $$("#lane-review .lane-card").forEach((el) => el.addEventListener("click", () => {
+    state.pendingOpen = { url: el.dataset.openUrl || null, company: el.dataset.openCo, role: el.dataset.openRole };
+    go(IDX.board);
+  }));
+  // Interview prep, two steps: AI suggests topics → you pick → roadmap to date.
+  $$("#view [data-prep]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".lane-card, .card");
+    const out = card.querySelector(".prep-out");
+    const co = card.dataset.co, role = card.dataset.role;
+    b.disabled = true;
+    out.innerHTML = `<div class="empty">${spin} Analysing what you should prepare for this role…</div>`;
+    try {
+      const { topics } = await api("/api/prep-topics", { method: "POST", body: { company: co, role } });
+      if (!topics.length) { out.innerHTML = `<div class="note">Couldn't derive topics — try again.</div>`; b.disabled = false; return; }
+      out.innerHTML = `
+        <div class="note" style="margin-bottom:8px">Pick what <b>you</b> want to focus on — I'll build a roadmap to your interview date.</div>
+        <div id="topics-${co.replace(/\W/g, "")}">${topics.map((t, i) => `
+          <label class="topic-opt"><input type="checkbox" data-topic="${esc(t.topic)}" ${t.priority === "high" ? "checked" : ""}>
+          <span><b>${esc(t.topic)}</b> <span class="pill ${t.priority === "high" ? "warn" : "off"}">${esc(t.priority)}</span><br><span class="hint">${esc(t.why)}</span></span></label>`).join("")}</div>
+        <div class="row" style="margin-top:10px"><button class="btn small primary" data-roadmap>Build my roadmap →</button></div>
+        <div class="roadmap-out"></div>`;
+      out.querySelector("[data-roadmap]").addEventListener("click", async (ev) => {
+        const chosen = [...out.querySelectorAll("[data-topic]:checked")].map((c) => c.dataset.topic);
+        if (!chosen.length) return toast("Pick at least one topic", true);
+        const ivDate = card.querySelector("[data-ivdate]").value;
+        const rout = out.querySelector(".roadmap-out");
+        ev.target.disabled = true;
+        rout.innerHTML = `<div class="empty">${spin} Building a roadmap${ivDate ? ` to ${ivDate}` : ""}…</div>`;
+        try {
+          const r = await api("/api/prep-roadmap", { method: "POST", body: { company: co, role, topics: chosen, interviewDate: ivDate } });
+          rout.innerHTML = `<div class="note">Saved to <code>${esc(r.file)}</code>.</div><div class="prose">${md(r.plan)}</div>`;
+        } catch (e) { rout.innerHTML = ""; toast(e.message, true); }
+      });
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+    b.disabled = false;
+  }));
+  $$("#view [data-status]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".lane-card, .card");
+    try {
+      await api("/api/track", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role, status: b.dataset.status } });
+      toast(`${card.dataset.co} → ${b.dataset.status}`);
+      stages.track();
+    } catch (e) { toast(e.message, true); }
+  }));
+  // Auto-draft a follow-up email
+  $$("#view [data-followup]").forEach((b) => b.addEventListener("click", async () => {
+    const card = b.closest(".lane-card");
+    const out = card.querySelector(".followup-out");
+    b.disabled = true;
+    out.innerHTML = `<div class="empty" style="padding:8px">${spin} Drafting…</div>`;
+    try {
+      const r = await api("/api/followup-draft", { method: "POST", body: { company: card.dataset.co, role: card.dataset.role, days: +b.dataset.days } });
+      out.innerHTML = `<div class="followup-draft"><pre>${esc(r.draft)}</pre><button class="btn small" data-copy-fu>Copy</button></div>`;
+      out.querySelector("[data-copy-fu]").addEventListener("click", () => copyText(r.draft, "Follow-up copied"));
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+    b.disabled = false;
+  }));
+  // Infer status from a pasted recruiter reply
+  $("#infer-btn")?.addEventListener("click", async () => {
+    const text = $("#infer-text").value.trim();
+    if (!text) return toast("Paste the recruiter's message", true);
+    $("#infer-out").innerHTML = `<div class="empty">${spin} Reading…</div>`;
+    try {
+      const r = await api("/api/infer-status", { method: "POST", body: { text } });
+      $("#infer-out").innerHTML = `<div class="note">Looks like <b>${esc(r.status)}</b>${r.company ? ` — ${esc(r.company)}` : ""} <span class="pill off">${esc(r.confidence)}</span><br>${esc(r.summary || "")}</div>
+        <div class="row"><input type="text" id="infer-co" placeholder="Company" value="${esc(r.company || "")}"><input type="text" id="infer-role" placeholder="Role"><button class="btn small primary" id="infer-apply">Set status → ${esc(r.status)}</button></div>`;
+      $("#infer-apply").addEventListener("click", async () => {
+        const co = $("#infer-co").value.trim(), role = $("#infer-role").value.trim();
+        if (!co || !role) return toast("Fill company + role to match the application", true);
+        try { await api("/api/track", { method: "POST", body: { company: co, role, status: r.status } }); toast(`${co} → ${r.status}`); stages.track(); }
+        catch (e) { toast(e.message, true); }
+      });
+    } catch (e) { $("#infer-out").innerHTML = ""; toast(e.message, true); }
+  });
+  $("#gmail-run")?.addEventListener("click", async () => {
+    const out = $("#gmail-out");
+    out.innerHTML = `<div class="empty">${spin} Checking your labelled inbox…</div>`;
+    try {
+      const r = await api("/api/gmail-pull", { method: "POST", body: {} });
+      out.innerHTML = `<pre class="log">${esc(r.output)}</pre>`;
+    } catch (e) { out.innerHTML = ""; toast(e.message, true); }
+  });
+};
 
 /* ── overlays (Reports / Model settings) ───────────────── */
 const overlays = {
@@ -790,14 +1591,196 @@ $$("[data-overlay]").forEach((b) => b.addEventListener("click", async () => {
 $("#overlay-close").addEventListener("click", () => ($("#overlay").hidden = true));
 $("#overlay").addEventListener("click", (e) => { if (e.target.id === "overlay") $("#overlay").hidden = true; });
 
+/* ── Ask Job Studio — the action-capable assistant ───────
+ * Chat is the command surface; the main window is the canvas. When the
+ * assistant emits an action, we run it against the existing endpoints and
+ * render the artifact (résumé draft, etc.) in a canvas overlay — never as a
+ * wall of text in the chat. Destructive actions confirm first.
+ */
+const askMsgs = [];
+function activeJobWs() {
+  const job = state.jobs?.find?.((j) => j.id === state.activeJob);
+  return job ? { job, w: (state.ws?.[job.id]) } : null;
+}
+function agentContext() {
+  const aj = activeJobWs();
+  return {
+    view: STAGES[state.stage]?.label || "?",
+    job: aj?.w ? { company: aj.w.company, role: aj.w.role, hasJd: (aj.w.jd || "").length > 80 } : null,
+  };
+}
+
+// Render résumé document links (PDF + LaTeX). When no LaTeX engine is present,
+// offers a one-click install (tectonic) and polls until ready, then rebuilds.
+function renderDocsLinks(host, r, draft) {
+  host.innerHTML = `<div class="note">
+    ${r.pdf ? `<a class="btn small primary" href="/api/file?f=${encodeURIComponent(r.pdf)}">⤓ PDF${r.pdfEngine === "latex" ? " (LaTeX)" : ""}</a> ` : ""}
+    ${r.tex ? `<a class="btn small" href="/api/file?f=${encodeURIComponent(r.tex)}">⤓ LaTeX .tex</a>` : ""}
+    ${r.latexNote ? `<div class="hint" style="margin-top:8px">${esc(r.latexNote)}
+      ${r.canInstall ? `<button class="btn small" id="install-latex">Install LaTeX engine (one-click)</button> or ` : " "}<a href="https://overleaf.com" target="_blank">Open Overleaf →</a></div>` : ""}
+    <div id="install-out"></div></div>`;
+  host.querySelector("#install-latex")?.addEventListener("click", async () => {
+    const out = host.querySelector("#install-out");
+    out.innerHTML = `<div class="hint" style="margin-top:8px">${spin} Installing tectonic — first time downloads ~30MB, a few minutes…</div>`;
+    try {
+      await api("/api/install-latex", { method: "POST", body: {} });
+      const poll = setInterval(async () => {
+        const { state } = await api("/api/latex-status");
+        if (state.log?.length) out.querySelector(".log-line") ? null : null;
+        if (!state.running) {
+          clearInterval(poll);
+          if (state.engine) {
+            out.innerHTML = `<div class="hint" style="margin-top:8px">✓ LaTeX engine ready — rebuilding your PDF…</div>`;
+            const r2 = await api("/api/resume-docs", { method: "POST", body: { draft: draft || undefined } });
+            renderDocsLinks(host, r2, draft);
+          } else {
+            out.innerHTML = `<div class="hint" style="margin-top:8px">Install didn't complete (${esc(state.error || "unknown")}). Try <code>brew install tectonic</code>, or use Overleaf.</div>`;
+          }
+        }
+      }, 4000);
+    } catch (e) { out.innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+  });
+}
+
+// Render a produced artifact in a canvas overlay with a primary action and,
+// when it's a résumé, buttons to build downloadable PDF + LaTeX documents.
+function showCanvas(title, bodyMd, primary, opts = {}) {
+  $("#overlay").hidden = false;
+  $("#overlay-body").innerHTML = `
+    <div class="row" style="margin-bottom:10px"><div class="page-title" style="font-size:20px;margin:0;flex:1">${esc(title)}</div>
+      ${opts.resumeDraft !== undefined ? `<button class="btn" id="canvas-docs">⤓ PDF + LaTeX</button>` : ""}
+      ${primary ? `<button class="btn primary" id="canvas-primary">${esc(primary.label)}</button>` : ""}</div>
+    <div id="canvas-docs-out"></div>
+    <div class="prose" style="max-height:60vh;overflow:auto">${md(bodyMd)}</div>`;
+  if (primary) $("#canvas-primary").addEventListener("click", async () => { await primary.onClick(); });
+  if (opts.resumeDraft !== undefined) {
+    $("#canvas-docs").addEventListener("click", async () => {
+      const btn = $("#canvas-docs"); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Building…`;
+      $("#canvas-docs-out").innerHTML = `<div class="note">Structuring your résumé and rendering documents — a moment on local models…</div>`;
+      try {
+        const r = await api("/api/resume-docs", { method: "POST", body: { draft: opts.resumeDraft || undefined } });
+        renderDocsLinks($("#canvas-docs-out"), r, opts.resumeDraft);
+      } catch (e) { $("#canvas-docs-out").innerHTML = ""; toast(e.message, true); }
+      btn.disabled = false; btn.innerHTML = "⤓ PDF + LaTeX";
+    });
+  }
+}
+
+// Execute one agent action. Returns a short status string for the chat.
+async function runAgentAction(action) {
+  const a = action.args || {};
+  const aj = activeJobWs();
+  const needJob = () => { if (!aj?.w) { toast("Open a job first", true); throw new Error("no job open"); } return aj; };
+  switch (action.name) {
+    case "navigate": {
+      const map = { cockpit: 6, apply: 6, track: 7, discover: 5, resume: 2, roles: 4, model: 1 };
+      const i = map[a.view]; if (i != null) go(i);
+      return `Opened ${a.view}.`;
+    }
+    case "regenerateResume": {
+      const r = await api("/api/regenerate-resume", { method: "POST", body: { instruction: a.instruction || "improve overall" } });
+      showCanvas("Revised résumé — review, download, or save", r.draft, {
+        label: "Save to cv.md",
+        onClick: async () => {
+          if (!confirm("Replace your master résumé (cv.md) with this version?")) return;
+          await api("/api/resume", { method: "POST", body: { content: r.draft } });
+          currentCvCache = r.draft; $("#overlay").hidden = true; toast("Saved to cv.md");
+        },
+      }, { resumeDraft: r.draft });
+      return "Drafted a revised résumé — open for review, with PDF + LaTeX download.";
+    }
+    case "tailorResume": {
+      const { w } = needJob();
+      const r = await api("/api/resume-chat", { method: "POST", body: { messages: [{ role: "user", content: a.instruction || "tailor to this job" }], jd: w.jd, company: w.company, role: w.role } });
+      if (r.draft) { w.improveDraft = r.draft; showCanvas(`Résumé tailored for ${w.company}`, r.draft, { label: "Use for this job", onClick: async () => { $("#overlay").hidden = true; w.improveOpen = true; renderWorkspace(); toast("Loaded into the job's résumé"); } }); }
+      return r.draft ? "Tailored the résumé for this job — review it." : r.reply;
+    }
+    case "evaluate": { const { job, w } = needJob(); w.report = null; w.running = false; runPipeline(job, w); return "Evaluating this job…"; }
+    case "generatePdf": { const { w } = needJob(); const context = [w.report && `FIT:\n${w.report}`].filter(Boolean).join("\n\n"); const r = await api("/api/tailored-pdf", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role, context } }); w.pdf = r.pdf; renderWorkspace(); return `Generated ${r.pdf}.`; }
+    case "draftCover": { const { w } = needJob(); const r = await api("/api/cover-letter", { method: "POST", body: { jd: w.jd, company: w.company, role: w.role } }); w.letter = r.letter; renderWorkspace(); return "Drafted the cover letter."; }
+    case "markApplied": { const { job, w } = needJob(); await trackJob(job, w, "Applied"); return "Marked applied."; }
+    case "addCompany": { if (!a.url) return "Give me the careers URL."; const r = await api("/api/add-company", { method: "POST", body: { url: a.url } }); return `Added ${r.name} (${r.provider}).`; }
+    case "scanNow": { toast("Scanning…"); const r = await api("/api/scan", { method: "POST", body: {} }); state.status = null; return `Scan done — ${r.pipeline.length} in inbox.`; }
+    case "backgroundEval": { await api("/api/background", { method: "POST", body: { action: "start", threshold: 4, limit: 20 } }); return "Background evaluation started."; }
+    default: return "";
+  }
+}
+
+function initAsk() {
+  const fab = $("#ask-fab"), panel = $("#ask-panel"), log = $("#ask-log"), input = $("#ask-in");
+  const paint = (pending) => {
+    log.innerHTML = (askMsgs.map((m) => `<div class="msg ${m.role}">${md(m.content)}</div>`).join("")
+      + (pending ? `<div class="msg assistant">${spin}</div>` : ""))
+      || `<div class="empty" style="padding:14px">Hi — I know your résumé, targets, and applications. Ask me anything, or tell me to <i>do</i> something: “make my résumé lead with GenAI”, “evaluate this job”, “add stripe's careers board”.</div>`;
+    log.scrollTop = log.scrollHeight;
+  };
+  const toggle = (on) => { panel.hidden = on === undefined ? !panel.hidden : !on; if (!panel.hidden) { paint(false); input.focus(); } };
+  fab.addEventListener("click", () => toggle());
+  $("#ask-close").addEventListener("click", () => toggle(false));
+  const send = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    askMsgs.push({ role: "user", content: text });
+    paint(true);
+    try {
+      const r = await api("/api/agent", { method: "POST", body: { messages: askMsgs, context: agentContext() } });
+      let content = r.reply || "";
+      if (r.action?.name) {
+        try { const status = await runAgentAction(r.action); if (status && !content) content = status; }
+        catch (e) { content += `\n\n_(couldn't ${r.action.name}: ${e.message})_`; }
+      }
+      askMsgs.push({ role: "assistant", content: content || "Done." });
+    } catch (e) { askMsgs.push({ role: "assistant", content: `⚠️ ${e.message}` }); }
+    paint(false);
+  };
+  $("#ask-send").addEventListener("click", send);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+}
+initAsk();
+
+/* ── Server health indicator (fixes silent 'paste the JD' on crash) ── */
+function initHealth() {
+  const el = $("#health");
+  if (!el) return;
+  let fails = 0;
+  const ping = async () => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch("/api/status", { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) throw new Error();
+      fails = 0;
+      el.className = "health ok";
+      el.title = "Studio connected";
+    } catch {
+      fails++;
+      if (fails >= 2) { el.className = "health down"; el.title = "Studio server not responding — restart: node studio/server.mjs"; }
+    }
+  };
+  ping();
+  setInterval(ping, 8000);
+}
+initHealth();
+
 /* ── boot: resume the journey where the user left off ──── */
 (async function boot() {
   try {
     const s = await loadStatus();
+    const prof = await api("/api/profile").catch(() => ({}));
+    state.profileName = prof.candidate?.full_name || "";
+    state.setup = { model: !!s.settings.model, cv: s.cv, roles: !!(s.portals && s.profile) };
+    // Setup complete → land in the cockpit. Otherwise resume the journey.
+    if (setupComplete()) {
+      state.maxStage = IDX.cockpit;
+      renderRail();
+      return go(IDX.cockpit);
+    }
     const iv = await api("/api/interview").then((r) => r.answers || {}).catch(() => ({}));
-    const done = [true, !!s.settings.model, s.cv, Object.keys(iv).some((k) => iv[k]?.length), s.portals && s.profile, s.pipeline > 0 || s.reports > 0];
+    const done = [true, state.setup.model, s.cv, Object.keys(iv).some((k) => iv[k]?.length), state.setup.roles, s.pipeline > 0 || s.reports > 0];
     let first = done.findIndex((d) => !d);
-    if (first === -1) first = 6;
+    if (first === -1) first = IDX.board;
     state.maxStage = Math.max(first, 0);
     renderRail();
     go(first <= 1 && !s.cv ? 0 : first);

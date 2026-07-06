@@ -16,6 +16,7 @@
       <div class="brand"><span class="spark">✦</span> Studio</div>
       <nav class="journey-rail" id="journey-rail"></nav>
       <div class="top-links">
+        <span id="health" class="health" title="Studio server status"><span class="health-dot"></span></span>
         <button class="link-btn" data-overlay="reports">Reports</button>
         <button class="link-btn" data-overlay="settings">Model</button>
       </div>
@@ -27,6 +28,20 @@
     <div class="overlay-card">
       <button class="overlay-close" id="overlay-close">×</button>
       <div id="overlay-body"></div>
+    </div>
+  </div>
+
+  <!-- Ask Job Studio — global assistant, available on every screen -->
+  <button id="ask-fab" title="Ask Job Studio">✦ Ask</button>
+  <div id="ask-panel" hidden>
+    <div class="ask-head">
+      <span><b>Ask Job Studio</b> — your co-pilot</span>
+      <button id="ask-close">×</button>
+    </div>
+    <div id="ask-log" class="chat-log"></div>
+    <div class="ask-input">
+      <input type="text" id="ask-in" placeholder="Ask anything — your search, a role, the market…">
+      <button class="btn primary" id="ask-send">Send</button>
     </div>
   </div>
 

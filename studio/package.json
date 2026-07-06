@@ -7,9 +7,15 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs",
-    "build:roles": "node scripts/build-roles.mjs"
+    "build:roles": "node scripts/build-roles.mjs",
+    "build:boards": "node scripts/build-boards.mjs",
+    "test": "node scripts/smoke.mjs",
+    "setup": "node setup.mjs"
   },
   "engines": {
     "node": ">=18"
+  },
+  "bin": {
+    "career-ops-studio": "setup.mjs"
   }
 }

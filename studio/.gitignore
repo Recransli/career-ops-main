@@ -1,3 +1,7 @@
 # Local secrets & settings (API keys live here — never commit)
 .local/
 node_modules/
+
+# per-job artifacts + telemetry (local)
+.local/jobs.json
+.local/telemetry.jsonl

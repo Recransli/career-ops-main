@@ -16,6 +16,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: `Can't reach Studio at ${STUDIO} — is it running? (${e.message})` }));
     return true; // async response
   }
+  if (msg.type === "resume-pdf") {
+    fetch(`${STUDIO}/api/latest-pdf?q=${encodeURIComponent(msg.q || "")}`)
+      .then((r) => r.json())
+      .then((data) => sendResponse({ ok: !data.error, ...data }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
   if (msg.type === "status") {
     fetch(`${STUDIO}/api/status`)
       .then((r) => r.json())
