@@ -751,7 +751,7 @@ function fillCvTemplate(data, candidate) {
       ? `<div class="cert-table">${data.certifications.map((x) => `
         <div class="cert-row"><span class="cert-title">${escHtml(x.title)}</span><span class="cert-org">${escHtml(x.org || "")}</span><span class="cert-year">${escHtml(x.year || "")}</span></div>`).join("")}</div>` : "",
     skills: (data.skills || []).length
-      ? `<div class="skills-grid">${data.skills.map((s) => `<div class="skill-item"><span class="skill-category">${escHtml(s.category)}:</span> ${escHtml(s.items)}</div>`).join("")}</div>` : "",
+      ? `<div class="skills-grid">${data.skills.map((s) => `<div class="skill-item">${s.category ? `<span class="skill-category">${escHtml(s.category)}:</span> ` : ""}${escHtml(s.items)}</div>`).join("")}</div>` : "",
   };
   const TITLES = {
     summary: "Professional Summary", competencies: "Core Competencies", experience: "Work Experience",
@@ -1741,11 +1741,19 @@ RULES:
 
       // Structure the résumé into the shared JSON (faithful — no invention).
       const raw = await chat(s, [
-        { role: "system", content: `Convert the candidate's résumé into STRICT JSON (no fences):\n{"summary":"","competencies":[],"experience":[{"company":"","role":"","period":"","location":"","bullets":[]}],"projects":[{"title":"","desc":"","tech":""}],"education":[{"title":"degree","org":"school","year":"","location":"","coursework":[]}],"certifications":[{"title":"","org":"","year":""}],"skills":[{"category":"","items":"comma-separated"}]}\nFAITHFUL: only restructure what's in the résumé — never add employers, dates, metrics, or claims. Omit sections with no content (empty arrays).\nEVERY experience entry MUST have at least one bullet (its real responsibilities/achievements). Every project MUST have a non-empty desc.` },
+        { role: "system", content: `Convert the candidate's résumé into STRICT JSON (no fences):\n{"summary":"","competencies":[],"experience":[{"company":"","role":"","period":"","location":"","bullets":[]}],"projects":[{"title":"","desc":"","tech":""}],"education":[{"title":"degree","org":"school","year":"","location":"","coursework":[]}],"certifications":[{"title":"","org":"","year":""}],"skills":[{"category":"","items":"comma-separated"}]}\nFAITHFUL: only restructure what's in the résumé — never add employers, dates, metrics, or claims. Omit sections with no content (empty arrays).\nEVERY experience entry MUST have at least one bullet (its real responsibilities/achievements). Every project MUST have a non-empty desc.\nFor skills, "category" is the short label BEFORE a colon (e.g. "Languages", "Databases", "AWS"); "items" is everything after. If a skill line has NO label (no colon), leave category "" and put the whole line in items — never repeat the line as the category.` },
         { role: "user", content: resumeMd.slice(0, 12000) },
       ], { maxTokens: 4096 });
       let data;
       try { data = JSON.parse((raw.match(/\{[\s\S]*\}/) || ["{}"])[0]); } catch { return fail(res, "The model returned malformed JSON — try again (larger models are more reliable).", 502); }
+      // Label-less skill lines (no "Category: items" split) come back with
+      // category === items — render them as a plain row, not "X: X".
+      for (const sk of data.skills || []) {
+        if (!sk) continue;
+        const cat = String(sk.category || "").trim(), items = String(sk.items || "").trim();
+        if (!items && cat) { sk.items = cat; sk.category = ""; }        // only a label → treat as content
+        else if (cat && items && cat.toLowerCase() === items.toLowerCase()) sk.category = ""; // duplicated → plain row
+      }
 
       const slug = slugify(`${candidate.full_name.split(" ")[0]}-resume`);
       const date = new Date().toISOString().slice(0, 10);
@@ -1776,7 +1784,7 @@ RULES:
         // \resumeItemListStart…End makes tectonic fail with "missing \item".
         experience: (data.experience || []).map((j) => ({ company: j.company || "", dates: j.period || "", role: j.role || "", location: j.location || "", bullets: (j.bullets || []).map((b) => String(b).trim()).filter(Boolean) })).filter((j) => (j.company || j.role) && j.bullets.length),
         projects: (data.projects || []).map((p) => ({ name: p.title || "", context: p.tech || "", dates: "", bullets: [p.desc, ...(p.bullets || [])].map((b) => String(b || "").trim()).filter(Boolean) })).filter((p) => p.name && p.bullets.length),
-        skills: (data.skills || []).filter((sk) => sk && sk.category && sk.items).map((sk) => ({ category: sk.category, items: sk.items })),
+        skills: (data.skills || []).filter((sk) => sk && sk.items).map((sk) => ({ category: sk.category || "", items: sk.items })),
       };
       const jsonPath = join(out, `cv-${slug}-${date}.payload.json`);
       const texPath = join(out, `cv-${slug}-${date}.tex`);
@@ -1790,6 +1798,8 @@ RULES:
         let t = readFileSync(texPath, "utf8");
         t = t.replace(/\\section\{[^}]*\}\s*\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd/g, "");
         t = t.replace(/\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd/g, "");
+        // Label-less skills: builder emits \textbf{}{: items} → render plain.
+        t = t.replace(/\\textbf\{\}\{:\s*([^\n]*?)\}(\s*\\\\)/g, "$1$2");
         writeFileSync(texPath, t);
       }
       // A tectonic-compatible variant: the template's \input{glyphtounicode} and

@@ -1,33 +1,95 @@
+<div align="center">
+
 # ✦ Career-Ops Studio
 
-A **minimal, local-first web UI** for [career-ops](https://github.com/santifer/career-ops) — bring your own model (a free local Ollama, or any API key) and run your whole job search from one clean screen.
+**A local-first AI cockpit for your job search.**
+Bring your own model — a free local Ollama or any API key — and run the whole hunt from one calm screen: discover roles, evaluate fit, tailor your résumé to a real LaTeX PDF, draft answers and cover letters, and track everything through to the interview.
 
-Studio is a *wrapper*, not a fork: it drives the career-ops scripts you already have (`scan.mjs`, `ollama-eval.mjs`, `openai-eval.mjs`) and reads/writes the same files the CLI uses. It never modifies career-ops system files, so `update-system.mjs` keeps working untouched.
+*Your résumé and keys never leave your machine.*
 
-## What you get
+![Cockpit](docs/img/cockpit.png)
 
-**Setup once, then it's a cockpit.** The first run is a guided journey (Model → Resume → a short interview → Roles → Discover); after that Studio opens to a **Cockpit** — a ranked queue of already-prepared, high-fit jobs waiting for a yes/no. A WebGL scene (three.js) sits behind it all. An **action-capable assistant** on every screen both advises *and* does: tell it "regenerate my résumé to lead with GenAI" or "add Stripe's careers board" and it acts, rendering the result in the window. Automation (daily scan + background prep of strong matches) runs so the work is done before you sit down.
+</div>
 
-- **Bring your own model** — local Ollama (free, private, offline) or any OpenAI-compatible API: OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, LM Studio, vLLM, llama.cpp. Pick the provider, fetch the model list, select, done. Keys live only in `studio/.local/` on your machine (gitignored).
-- **Any-format resume** — PDF, DOCX, PNG/JPG (via your vision model), LaTeX, Markdown, or plain text. PDFs and DOCX are extracted *in your browser* (pdf.js / mammoth); everything is faithfully transcribed to markdown by your model, and **you review the conversion before it's saved** as `cv.md`, the single source of truth.
-- **The onboarding interview** — answer everything applications ask, exactly once: authorization, sponsorship, salary, notice, relocation, clearance, your story, and *optional* self-identification (gender, race/ethnicity, veteran, disability — used only to pre-fill the EEO sections you'd fill anyway; "Prefer not to say" is always an answer). Do it as a form, or **talk it through in chat**: the companion reads real postings for your target role from your own scan and asks what those applications will actually want. Your **street address autocompletes** (keyless OSM geocoder) and fills city/state/ZIP/country as validated components.
-- **1,300+ searchable job roles** across 16 fields — pick your targets and the portal scanner's keywords and your profile are configured automatically.
-- **Pick your boards & companies** — the Discover step is a picker: 13 remote/aggregator boards (RemoteOK, We Work Remotely, Remotive, Himalayas, Arbeitnow, HN Who's Hiring…) and 75+ direct-company career sites (Anthropic, Stripe, Figma, Databricks, Notion…), filterable by name or tag. Your selection is written into `portals.yml` with the right ATS API for each. Precise phrase-level keywords (from your target roles) cut the false positives that bare words like "Engineer" caused.
-- **Add any company yourself** — paste a Greenhouse/Lever/Ashby careers URL; Studio detects the ATS, verifies the board responds, and adds it to your scan.
-- **Daily refresh** — turn on an automatic daily re-scan at a time you choose (default 12:00), optionally chaining a background evaluation of new jobs. Runs while Studio is open; for always-on (updates even when Studio is closed), one command installs a macOS launchd agent — see below.
-- **Background evaluation** — kick off evaluation of your inbox in the background; for strong matches (≥ your threshold, default 4/5) Studio auto-prepares the tailored PDF and cover letter, so high-fit jobs are ready when you sit down. Start/stop with live progress.
-- **Zero-token job scanning** — hits Greenhouse/Lever/Ashby and 40+ other job-board APIs directly through career-ops' scanner. No AI cost to find openings.
-- **A job board that does the reading for you** — thousands of scanned postings with status tabs (Inbox / Evaluated / Applied), location and role filters, search and sorting. Pick a job and **the full posting loads by itself** from the Greenhouse/Lever/Ashby public APIs (page-text fallback for everything else) — no copy-pasting JDs. The workspace then offers four moves: **Evaluate** (full A–G report, fit score /5), **Tailor resume**, **Answers**, **Cover letter**. *"I applied"* asks for a quick note while it's fresh, tracks the job through career-ops' pipeline, and moves you on.
-- **One-pass application prep (no tabs)** — open a job and the posting loads itself; press **Prepare this application** and Studio runs the whole chain automatically: evaluate fit → read the live market → tailor your résumé to a PDF *using the fit + market analysis as context* → draft the cover letter. A stepper shows progress; each result appears as a section you can expand, re-run, or (for the résumé) refine in a collapsible inline chat. Every artifact is saved per-posting, so reopening the job restores everything.
-- **Track — after you hit submit** — every applied job with days-since-applied and follow-up timing. Set an **interview date**, get **AI-suggested prep topics** ranked by priority, tick the ones you care about, and Studio builds a **time-blocked roadmap to that date** (saved to `interview-prep/`, where career-ops' interview modes read it). One-click status updates (Responded → Interview → Offer). Optional Gmail plugin keeps recruiter responses flowing in.
-- **Local telemetry** — anonymous usage counts (which steps run, how often) are appended to `studio/.local/telemetry.jsonl` on your machine only, to inform future design — never uploaded.
-- **One-click tailored PDF** — the Tailor tab reorders and rephrases your resume for the specific JD (same facts, never new ones) and renders it through career-ops' ATS-clean template with Playwright. The generator even verifies the section order matches your own `cv.md`.
-- **Live résumé improvement** — the Improve tab is a split view: your résumé preview on one side, a chat on the other. Ask it to sharpen bullets or align to the JD; the rewritten résumé appears in the preview, and you decide whether to save it back to `cv.md`. Reorders and rephrases only — never invents.
-- **Market intel from the live web** — the Market tab searches the internet (keyless) for what employers want for the role *right now*, reads the top results, and distills in-demand skills, what's rising this year, and how you stack up — with sources cited.
-- **Ask Job Studio** — a floating co-pilot on every screen. It knows your résumé, targets, interview answers, and what you've applied to, and pulls the web when you ask about current trends or salary. Advisory only: it never edits files or submits.
-- **Choice-based locations everywhere** — every location field (home, target cities, street address) is a pick-from-real-places autocomplete, so what's stored is always a validated place, never a typo.
-- **A browser extension that fills applications** (`studio/extension/`) — on the actual job posting, one click scrapes the form, asks your local Studio for grounded values, fills the fields and highlights them. It never touches the submit button.
-- Facts your resume doesn't cover come back as `[ADD: …]` placeholders — the model is instructed to never invent, and you should still read every word.
+---
+
+Studio is a **wrapper**, not a fork. It drives the [career-ops](https://github.com/santifer/career-ops) scripts you already have (`scan.mjs`, `ollama-eval.mjs`, `openai-eval.mjs`, the CV/LaTeX pipeline) and only ever writes the same **user-layer** files the CLI uses (`cv.md`, `config/profile.yml`, `portals.yml`). It never touches career-ops system files, so `update-system.mjs` keeps working. No framework, no build step — vanilla HTML/CSS/JS over a zero-dependency Node server.
+
+## Why it's different
+
+- **Bring your own model.** Local Ollama (free, private, offline) or any OpenAI-compatible API — OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, LM Studio, vLLM. Keys stay in `studio/.local/` (gitignored).
+- **Local-first.** No account, no cloud, no telemetry leaves the box. Your CV is a file on your disk.
+- **It does the work before you sit down.** Scan on a schedule, evaluate in the background, auto-prepare high-fit matches — then just decide.
+- **It never fabricates and never auto-submits.** Everything is grounded in your résumé; missing facts become `[ADD: …]`; the submit button is always yours.
+
+## Quick start
+
+```bash
+git clone https://github.com/santifer/career-ops
+cd career-ops
+node studio/setup.mjs        # checks Node, installs deps, finds a model, launches + opens
+```
+
+`setup.mjs` is the front door — a preflight doctor (Node 18+, dependencies, a reachable model, a free port) that fixes what it can, then opens `http://localhost:4949`. To just start it: `node studio/server.mjs`.
+
+Local model? Install [Ollama](https://ollama.com) and pull something with headroom:
+
+```bash
+ollama pull qwen2.5-coder:32b   # good default; 32B+ recommended — small models embellish
+```
+
+---
+
+## The journey → the cockpit
+
+The first run is a short guided **Setup** (Model → Résumé → a quick interview about you → Roles → Boards). After that, Studio opens straight to the **Cockpit** (the screenshot up top) — a ranked queue of already-prepared, high-fit jobs waiting for a yes/no — and Setup collapses into the ⚙ menu.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/img/welcome.png" alt="Welcome"></td>
+<td width="50%"><img src="docs/img/interview.png" alt="About you"></td>
+</tr>
+<tr>
+<td><b>Setup, once.</b> Pick your engine, bring your résumé in any format, and you're moving.</td>
+<td><b>The interview.</b> Answer what applications always ask — authorization, sponsorship, salary, notice, EEO (optional), your story — once. Talk it through in chat or fill the form; your locations autocomplete to real, validated places and pin on the globe.</td>
+</tr>
+</table>
+
+**Any-format résumé:** PDF, DOCX, PNG/JPG (via your vision model), LaTeX, Markdown, or plain text. PDFs/DOCX are extracted *in your browser*; your model transcribes faithfully and **you review before it's saved** as `cv.md`, the single source of truth.
+
+## Discover — your boards, your companies
+
+![Discover](docs/img/discover.png)
+
+Pick which sources to scan: **13 remote/aggregator boards** (RemoteOK, We Work Remotely, Remotive, Himalayas, Arbeitnow, HN Who's Hiring…) and **75+ direct-company career sites** (Anthropic, Stripe, Figma, Databricks, Notion…), filterable by name or tag. Paste any Greenhouse/Lever/Ashby careers URL to add a company yourself — Studio detects the ATS and verifies it responds. Scanning hits public job-board APIs directly: **zero AI tokens**. Precise phrase-level keywords keep the false positives down.
+
+Below the picker: **Background evaluation** (auto-prepare strong matches while you're away) and **Daily refresh** (re-scan at a set hour; on macOS, one command makes it always-on).
+
+## Apply — one posting at a time, no busywork
+
+![Apply](docs/img/apply.png)
+
+Thousands of scanned postings sit in a filterable rail (status tabs, location + role filters, search). Pick one and **the full job description loads itself** from the ATS API — no copy-pasting. Then hit **Prepare this application** and Studio runs the whole chain automatically:
+
+**Evaluate fit (A–G)** → **read the live market** → **tailor your résumé to a PDF** (using the fit + market analysis as context) → **draft the cover letter.**
+
+A stepper shows progress; each result is an expandable section. The tailored résumé has a **collapsible inline chat** to refine it, and everything is saved per-posting so reopening restores it. *"I applied"* tracks it and moves you on — and a browser extension can fill the actual form for you.
+
+### Résumé documents — real LaTeX PDF + `.tex`
+
+Every tailored or regenerated résumé can be downloaded as a **LaTeX-compiled PDF** *and* its **`.tex` source** (Overleaf-ready). Studio structures your résumé once (faithfully — no invention) and builds both through career-ops' own LaTeX template. No LaTeX engine installed? One click installs [tectonic](https://tectonic-typesetting.github.io/) (Homebrew or a prebuilt binary into `studio/.local/`), then compiles locally — no terminal.
+
+## Ask Job Studio — an assistant that *acts*
+
+![Assistant](docs/img/assistant.png)
+
+The floating co-pilot knows your résumé, targets, interview answers, and applications — and it both advises **and does things**. Tell it *"make my résumé lead with GenAI"* or *"add Stripe's careers board and rescan"* and it acts, rendering the result **in the window** (the revised résumé opens on a canvas with Download PDF/LaTeX and Save), while the chat just narrates. It pulls the live web for market and salary questions. It can regenerate/tailor résumés, evaluate, generate PDFs, draft cover letters, mark applied, add companies, scan, and start background prep — with confirmation on anything destructive, and never a fabricated fact or an auto-submit.
+
+## Track — your whole hunt on one board
+
+![Track](docs/img/track.png)
+
+A three-lane pipeline: **To review → Applied → Interviewing.** Jobs move rightward as they progress. Applied cards show days-since and one-click **follow-up email drafts** when they go quiet; paste any recruiter reply and Studio suggests the status update (no Gmail OAuth needed). For interviews, set a date and get **AI-suggested prep topics** — tick the ones you care about and Studio builds a **time-blocked roadmap to that date**, saved where career-ops' interview modes read it.
 
 ## The browser extension
 
@@ -35,70 +97,25 @@ Studio is a *wrapper*, not a fork: it drives the career-ops scripts you already 
 chrome://extensions → Developer mode → Load unpacked → select studio/extension/
 ```
 
-Keep Studio running (`node studio/server.mjs`). On any application page, click the ✦ icon → **Fill this form**. Fields are drafted from your resume, profile, and interview answers, then highlighted orange for your review.
+On any application page, click ✦ → **Fill this form**. It's **type-aware**: native selects get *selected*, radio groups *clicked*, custom comboboxes (Greenhouse/react-select — even button-triggered) opened and matched then **verified**, and your latest **tailored PDF attached automatically** to Resume/CV uploads. It **never** ticks a consent box, never auto-answers EEO questions from anything but your explicit choices, and never submits. On submission it offers, one click, to mark the job Applied so your tracker stays in sync.
 
-The extension is **type-aware**: native selects get an option *selected*, radio groups get the matching option *clicked*, custom comboboxes (Greenhouse/react-select "Select…" widgets — even button-triggered ones) are opened, their real options read, and the match clicked like a human would, then **verified** — if the widget didn't register the choice it retries (type + Enter) and otherwise flags the field instead of leaving loose text. Resume/CV upload fields get your latest **tailored PDF attached automatically**. After filling, anything the page still marks invalid is highlighted for you.
+Safety is enforced server-side, not just prompted: your interview answers are authoritative (a model once turned "2 weeks" into "30 days" — caught), and sensitive fields stay blank unless you've answered them.
 
-Safety is enforced server-side, not just prompted:
-- **Your interview answers are authoritative.** Models reinterpret logistics (we caught one turning "2 weeks" into "30 days") — so authorization, sponsorship, salary, notice, relocation, clearance and self-ID fields are filled *verbatim* from your answers, corrected against them for choice fields, and left blank if you haven't answered.
-- Self-identification fills **only** from your explicit optional answers; orientation, religion, DOB, marital and criminal-history questions are never auto-answered at all.
-- Consent/certification checkboxes are never ticked for you.
-- Nothing is ever clicked or submitted. The extension fills and highlights, you review and send.
+## Run it like a Mac app (optional)
 
-A local test harness (`http://localhost:4949/test-form.html`) runs the exact shipping content script against a mock application form — native fields, comboboxes, radios, consent boxes, file upload — so every fill behavior above is verifiable on your machine.
+No Electron, no build. On macOS:
 
-**Auto-tracking on submit:** on Greenhouse/Lever/Ashby/Workday application pages the extension also watches for a real submission (submit click + a "thank you / received" confirmation) and offers — one click, never automatic — to mark that job **Applied** in Studio, so your tracker and monitoring stay in sync without you switching tabs.
+- **Double-click** `studio/mac/launch.command` — starts the server and opens Studio.
+- **Always-on:** `bash studio/mac/install.sh` installs a `launchd` agent so Studio starts at login, restarts if it crashes, and the daily refresh fires even when the app is closed. Remove with `--remove`.
 
-## Quick start
+*Why not a packaged `.app`?* Electron/Tauri would add ~150 MB and a build step, breaking the zero-dependency, cross-platform, publish-to-GitHub design. `launchd` gets you "always-on + scheduled" natively.
 
-```bash
-git clone https://github.com/santifer/career-ops
-cd career-ops
-node studio/setup.mjs      # checks Node, installs deps, finds a model, launches + opens
-```
+## Safety & ethics
 
-`setup.mjs` is the front door: it runs a preflight doctor (Node 18+, dependencies, a reachable model, a free port), fixes what it can, then starts Studio and opens `http://localhost:4949`. Run `node studio/setup.mjs --check` to just see the report. If you'd rather start it plainly: `node studio/server.mjs`.
-
-The first time, Studio walks you through a short **Setup journey** (model → résumé → a quick interview → target roles → boards). After that it opens straight to your **Cockpit** — a decision queue of already-prepared, high-fit jobs — and Setup collapses into the ⚙ menu.
-
-Using a local model? Install [Ollama](https://ollama.com) and pull something with enough headroom:
-
-```bash
-ollama pull qwen2.5-coder:32b   # good default if you have ~24GB (V)RAM
-```
-
-> **Model size matters.** Per the career-ops docs, 7–8B models are too weak for the structured evaluation format — they miss the schema and, worse, *embellish*. Use **32B+** for evaluations you'll trust. Smaller models are OK for cover-letter first drafts you'll edit heavily. A cheap hosted option (DeepSeek, OpenRouter Llama 3.3 70B) costs cents and beats a small local model.
-
-### Run it like a Mac app (optional)
-
-No Electron, no build — Studio stays a plain local server. On macOS you get two native conveniences:
-
-- **Double-click launcher:** open `studio/mac/launch.command` — it starts the server if needed and opens Studio in your browser. (First run: right-click → Open to clear Gatekeeper.)
-- **Always-on + daily refresh:** run `bash studio/mac/install.sh` once. It installs a launchd LaunchAgent so Studio starts at login, restarts if it crashes, and the daily refresh (set in Discover → Daily refresh) fires on schedule even when you haven't opened the app. Uninstall with `bash studio/mac/install.sh --remove`.
-
-Why not a full Mac app? An Electron/Tauri build would add ~150 MB and a build step, breaking the zero-dependency, cross-platform, publish-to-GitHub design. `launchd` is the macOS-native way to get "always running + scheduled" without any of that.
-
-Pointing Studio at a career-ops checkout somewhere else:
-
-```bash
-CAREER_OPS_ROOT=/path/to/career-ops node server.mjs
-PORT=5050 node server.mjs   # different port
-```
-
-## Privacy & data
-
-- Binds to `127.0.0.1` only — nothing is exposed to your network.
-- Your resume, reports, and tracker are plain files in your career-ops checkout. No database, no account, no telemetry.
-- Your resume and JDs are sent **only** to the model endpoint you configure. Choose Ollama and nothing ever leaves your machine.
-- API keys are stored in `studio/.local/settings.json`, which is gitignored.
-
-## The line this tool won't cross
-
-Studio inherits career-ops' ethics rules and enforces them:
-
-- **It never submits an application for you.** It drafts, evaluates, and prepares — the submit button is always yours.
-- **Quality over quantity.** Low-fit roles (score < 4/5) are flagged as not worth applying to. Five tailored applications beat fifty generic ones — for you *and* for the humans reading them.
-- **No fabrication.** Generated answers and letters are grounded in your resume. Missing facts become `[ADD: …]` placeholders, not inventions. Review everything before you use it — small models especially will try to flatter you.
+- **Local-first** — CV and keys never leave your machine except to the model endpoint you choose.
+- **Never auto-submits** — Studio drafts, tailors, and fills up to the submit button; you press it.
+- **Quality over quantity** — sub-4/5 fits are flagged as not worth applying to.
+- **No fabrication** — everything is grounded in your résumé; gaps become `[ADD: …]` placeholders.
 
 ## Architecture
 
@@ -110,23 +127,16 @@ studio/
 ├── extension/           # Chrome/Edge form-filler (load unpacked)
 ├── mac/                 # double-click launcher + launchd always-on install
 ├── data/                # generated catalogs (roles, boards) + build scripts
-├── scripts/smoke.mjs    # endpoint smoke tests (npm test)
+├── scripts/             # smoke tests, screenshot capture, catalog builders
 └── .local/              # your settings, keys, per-job artifacts (gitignored)
 ```
 
-The server only ever writes career-ops **user-layer** files (`cv.md`, `config/profile.yml`, `portals.yml`) and delegates evaluation/scanning to career-ops' own scripts — so everything Studio produces is also visible to the career-ops CLI, and vice versa.
-
-Run the tests: `npm test` (boots the server on a scratch dir and checks the endpoints — no model needed).
+Run the tests: `npm test` (boots the server on a scratch dir, checks 21 endpoints — no model needed).
 
 ## Sharing it with others
 
-Studio is **local-first** — a person's résumé and keys never leave their machine — which makes it safe to hand around:
-
-- **One command:** `node studio/setup.mjs` does the doctor + install + launch. That's the whole onboarding.
-- **The extension** installs unpacked today (`chrome://extensions` → Developer mode → Load unpacked → `studio/extension/`); a Chrome Web Store listing is the next step for one-click install.
-- **Docker:** career-ops ships a `Dockerfile`; run the server in a container and browse to it locally if you'd rather not put Node on the host.
-- **No account, no cloud, no telemetry leaves the box** — usage counts stay in `studio/.local/telemetry.jsonl` for your own tuning.
+Local-first makes it safe to hand around. `node studio/setup.mjs` is the whole onboarding. The extension installs unpacked today (Chrome Web Store is the next step). career-ops ships a `Dockerfile` if you'd rather not put Node on the host.
 
 ## Credits
 
-Built as a community wrapper around [santifer/career-ops](https://github.com/santifer/career-ops). The evaluation logic, scanner, and pipeline are career-ops' own — Studio just gives them a face.
+Built as a community wrapper around [santifer/career-ops](https://github.com/santifer/career-ops). The evaluation logic, scanner, and CV/LaTeX pipeline are career-ops' own — Studio gives them a cockpit.
