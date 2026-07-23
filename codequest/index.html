@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Conquest — The Iron Compiler</title>
+<meta name="description" content="A story-driven conquest where every province is sealed by a coding puzzle. Write JavaScript, break the seal, take the throne.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<canvas id="fx" aria-hidden="true"></canvas>
+<canvas id="world" aria-hidden="true"></canvas>
+<div id="vignette" aria-hidden="true"></div>
+
+<!-- ══════════════ TITLE ══════════════ -->
+<section id="screen-title" class="screen is-active">
+  <div class="title-wrap">
+    <div class="title-crest" aria-hidden="true">
+      <svg viewBox="0 0 120 120">
+        <circle class="crest-ring" cx="60" cy="60" r="52"/>
+        <circle class="crest-ring crest-ring--inner" cx="60" cy="60" r="42"/>
+        <path class="crest-mark" d="M60 20 L78 46 L60 72 L42 46 Z"/>
+        <path class="crest-mark" d="M60 62 L60 100"/>
+        <path class="crest-mark" d="M46 88 L74 88"/>
+        <g class="crest-rays">
+          <path d="M60 4 L60 14"/><path d="M60 106 L60 116"/>
+          <path d="M4 60 L14 60"/><path d="M106 60 L116 60"/>
+        </g>
+      </svg>
+    </div>
+    <p class="title-kicker">Three acts. Twelve seals. One compiler.</p>
+    <h1 class="title-main"><span>Code</span> <span>Conquest</span></h1>
+    <p class="title-sub">The Iron Compiler</p>
+    <p class="title-blurb">
+      The realm was held together by logic, and the logic broke. You are the last Architect.
+      March from the drowned coast to the Obsidian Throne — and rewrite every seal that stands in your way.
+    </p>
+    <div class="title-actions">
+      <button id="btn-begin" class="btn btn--primary">Begin the March</button>
+      <button id="btn-continue" class="btn" hidden>Resume Campaign</button>
+    </div>
+    <p class="title-foot">Real Python · runs entirely in your browser · nothing leaves this page</p>
+  </div>
+</section>
+
+<!-- ══════════════ MAP ══════════════ -->
+<section id="screen-map" class="screen">
+  <header class="map-head">
+    <div>
+      <p class="eyebrow">The Shattered Realm</p>
+      <h2 class="map-title">War Map</h2>
+    </div>
+    <div class="map-head-right">
+      <div class="progress-pill"><span id="progress-count">0</span> / 12 seals broken</div>
+      <button id="btn-reset" class="btn btn--ghost btn--sm">Reset campaign</button>
+    </div>
+  </header>
+
+  <div class="map-stage">
+    <div id="realm-map" class="realm-map"></div>
+    <aside id="map-brief" class="map-brief">
+      <p class="eyebrow">Next objective</p>
+      <h3 id="brief-name">—</h3>
+      <p id="brief-sub" class="brief-sub">—</p>
+      <div class="brief-line"></div>
+      <p id="brief-text" class="brief-text">—</p>
+      <button id="btn-march" class="btn btn--primary btn--block">March</button>
+    </aside>
+  </div>
+</section>
+
+<!-- ══════════════ CHAPTER (story + puzzle) ══════════════ -->
+<section id="screen-chapter" class="screen">
+
+  <!-- Cinematic story layer -->
+  <div id="cinema" class="cinema">
+    <div class="cinema-bg" id="cinema-bg"></div>
+    <div class="cinema-sigil" id="cinema-sigil" aria-hidden="true"></div>
+    <div class="cinema-chapter">
+      <p class="eyebrow" id="cin-chapter">Chapter I</p>
+      <h2 id="cin-place">—</h2>
+    </div>
+
+    <div class="dialogue" id="dialogue">
+      <div class="dialogue-portrait" id="dlg-portrait" aria-hidden="true"></div>
+      <div class="dialogue-body">
+        <p class="dialogue-name" id="dlg-name">—</p>
+        <p class="dialogue-text" id="dlg-text"></p>
+      </div>
+      <div class="dialogue-next" id="dlg-next" aria-hidden="true">▾</div>
+    </div>
+    <button id="btn-skip" class="btn btn--ghost btn--sm cinema-skip">Skip scene</button>
+  </div>
+
+  <!-- Puzzle layer -->
+  <div id="warroom" class="warroom">
+    <aside class="council">
+      <button id="btn-retreat" class="btn btn--ghost btn--sm council-back">← War map</button>
+
+      <div class="council-chapter">
+        <p class="eyebrow" id="wr-chapter">Chapter I</p>
+        <h3 id="wr-place">—</h3>
+      </div>
+
+      <div class="paused" id="paused-note">
+        <span class="paused-icon" aria-hidden="true">❚❚</span>
+        <div>
+          <strong>Story paused</strong>
+          <span id="paused-sub">The chapter resumes when the seal breaks.</span>
+        </div>
+      </div>
+
+      <div class="foe" id="foe">
+        <div class="foe-sigil" id="foe-sigil" aria-hidden="true"></div>
+        <p class="foe-label">Seal-keeper</p>
+        <p class="foe-name" id="foe-name">—</p>
+        <div class="hp">
+          <div class="hp-track"><div class="hp-fill" id="hp-fill"></div></div>
+          <p class="hp-text"><span id="hp-text">0 / 0</span> seals broken</p>
+        </div>
+        <p class="foe-taunt" id="foe-taunt">—</p>
+      </div>
+
+      <div class="counsel" id="counsel" hidden>
+        <div class="counsel-portrait" id="counsel-portrait" aria-hidden="true"></div>
+        <div class="counsel-body">
+          <p class="counsel-name">Vex</p>
+          <p class="counsel-text" id="counsel-text">—</p>
+          <div class="counsel-actions">
+            <button id="btn-hint" class="btn btn--sm btn--primary">Give me a nudge</button>
+            <button id="btn-nohint" class="btn btn--sm btn--ghost">I've got this</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="hints" id="hints"></div>
+    </aside>
+
+    <main class="workbench">
+      <section class="brief-card">
+        <div class="brief-card-head">
+          <p class="eyebrow">The Seal</p>
+          <code class="sig" id="task-sig">—</code>
+        </div>
+        <div class="brief-card-body" id="task-brief">—</div>
+      </section>
+
+      <section class="editor-card">
+        <div class="editor-head">
+          <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+          <span class="editor-file" id="editor-file">seal.js</span>
+          <span class="editor-hint">⌘/Ctrl + Enter to strike</span>
+        </div>
+        <div class="editor" id="editor">
+          <div class="gutter" id="gutter" aria-hidden="true"></div>
+          <div class="code-wrap">
+            <pre class="highlight" id="highlight" aria-hidden="true"><code></code></pre>
+            <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"
+                      autocorrect="off" wrap="off" aria-label="Code editor"></textarea>
+          </div>
+        </div>
+        <div class="editor-foot">
+          <button id="btn-run" class="btn btn--primary">Strike the seal</button>
+          <button id="btn-reset-code" class="btn btn--ghost btn--sm">Reset code</button>
+          <span class="editor-status" id="run-status"></span>
+        </div>
+      </section>
+
+      <section class="results-card">
+        <p class="eyebrow">Trial results</p>
+        <ul class="results" id="results"></ul>
+      </section>
+    </main>
+  </div>
+</section>
+
+<!-- ══════════════ EPILOGUE ══════════════ -->
+<section id="screen-end" class="screen">
+  <div class="end-wrap">
+    <div class="end-crest" aria-hidden="true">
+      <svg viewBox="0 0 120 120">
+        <circle class="crest-ring" cx="60" cy="60" r="52"/>
+        <path class="crest-mark" d="M30 74 L45 40 L60 62 L75 34 L90 74 Z"/>
+        <path class="crest-mark" d="M30 82 L90 82"/>
+      </svg>
+    </div>
+    <p class="eyebrow">The campaign is ended</p>
+    <h2 class="end-title">The Realm Recompiled</h2>
+    <div class="end-text" id="end-text"></div>
+    <div class="end-stats" id="end-stats"></div>
+    <div class="title-actions">
+      <button id="btn-again" class="btn btn--primary">March again</button>
+    </div>
+  </div>
+</section>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<!-- three.js powers the first-person halls. It is an ES module, so it loads
+     after the classic scripts below; this shim queues any early calls and
+     world.js drains the queue once it boots. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script>
+  window.World = { _q: [], supported: false };
+  ['enter', 'speak', 'pause', 'resume', 'win', 'jolt', 'leave', 'epilogue'].forEach(function (fn) {
+    window.World[fn] = function () { window.World._q.push([fn, [].slice.call(arguments)]); };
+  });
+</script>
+
+<script src="js/fx.js"></script>
+<script src="js/levels.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/runner.js"></script>
+<script src="js/map.js"></script>
+<script src="js/game.js"></script>
+<script type="module" src="js/world.js?v=2"></script>
+</body>
+</html>

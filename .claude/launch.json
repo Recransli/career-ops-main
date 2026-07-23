@@ -5,7 +5,15 @@
       "name": "studio",
       "runtimeExecutable": "node",
       "runtimeArgs": ["studio/server.mjs"],
-      "port": 4949
+      "port": 4949,
+      "autoPort": false
+    },
+    {
+      "name": "codequest",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8099", "--directory", "codequest"],
+      "port": 8099,
+      "autoPort": false
     }
   ]
 }
