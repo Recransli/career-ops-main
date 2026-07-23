@@ -263,3 +263,4 @@ desaturates it behind the code panel. A student typing for ten minutes costs zer
 Palettes live in `ACT_LOOK` at the top of `js/world.js`. Room dimensions come from the
 `rnd()` calls at the top of `buildHall()`. Both are safe to edit — nothing else reads
 them.
+
